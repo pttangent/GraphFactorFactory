@@ -52,7 +52,7 @@ class CanonicalGraphStore:
             connection.close()
         return catalog_path
 
-    def write_manifest(self, trade_date: str, source_fingerprint: SourceFingerprint, config: BuildConfig, universe_count: int, node_feature_columns: list[str]) -> Path:
+    def write_manifest(self, trade_date: str, source_fingerprint: SourceFingerprint, config: BuildConfig, universe_count: int, node_feature_columns: list[str], split_source_metadata: dict[str, Any] | None = None) -> Path:
         manifest_path = self.root / "manifest.json"
         existing: dict[str, Any] = json.loads(manifest_path.read_text()) if manifest_path.exists() else {"dates": {}}
         existing.update({
@@ -67,6 +67,7 @@ class CanonicalGraphStore:
             "config_hash": config.config_hash,
             "universe_count": universe_count,
             "node_feature_columns": node_feature_columns,
+            "split_source_metadata": split_source_metadata,
         })
         existing.setdefault("dates", {})[trade_date] = self.count_date_rows(trade_date)
         manifest_path.write_text(json.dumps(existing, indent=2, default=str))
