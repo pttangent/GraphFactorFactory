@@ -13,16 +13,21 @@ class StableCoreTracker:
         self.state = PathState(history_frames)
 
     def assign(self, current, previous, previous_records, *, timestamp, frame_minutes):
+        pool = {item.theme_path_id: item for item in previous}
+        for path_id, item in self.state.last.items():
+            if self.state.missed.get(path_id, 0) <= self.grace_frames:
+                pool.setdefault(path_id, item)
+        previous_pool = list(pool.values())
+
         selected, used_paths = match_paths(
             current,
-            previous,
+            previous_pool,
             self.state.members,
             threshold=self.threshold,
             min_hits=self.min_hits,
         )
         assigned = []
         records = []
-        previous_by_path = {item.theme_path_id: item for item in previous}
 
         for candidate in current:
             match = selected.get(candidate.theme_instance_id)
@@ -41,7 +46,7 @@ class StableCoreTracker:
                 )
             else:
                 old, score, retention = match
-                prior = previous_records.get(old.theme_instance_id)
+                prior = previous_records.get(old.theme_instance_id) or self.state.records.get(old.theme_path_id)
                 age = (prior.age_frames if prior else 1) + 1
                 event = "revival" if self.state.missed.get(old.theme_path_id, 0) else "continuation"
                 updated = replace(candidate, theme_path_id=old.theme_path_id, stability_score=score)
@@ -59,28 +64,40 @@ class StableCoreTracker:
                 )
             assigned.append(updated)
             records.append(record)
-            self.state.observe(updated.theme_path_id, updated.members)
+            self.state.observe(updated.theme_path_id, updated, record)
 
-        for path_id, old in previous_by_path.items():
+        for path_id, old in pool.items():
             if path_id in used_paths:
                 continue
-            prior = previous_records.get(old.theme_instance_id)
+            prior = previous_records.get(old.theme_instance_id) or self.state.records.get(path_id)
             missed = self.state.miss(path_id)
             if missed <= self.grace_frames:
-                records.append(LifecycleRecord(
-                    path_id, old.theme_instance_id, timestamp,
-                    "dormant", "dormant",
+                record = LifecycleRecord(
+                    path_id,
+                    old.theme_instance_id,
+                    timestamp,
+                    "dormant",
+                    "dormant",
                     prior.age_frames if prior else 1,
                     prior.duration_minutes if prior else frame_minutes,
-                    0.0, 0.0, old.theme_instance_id,
-                ))
+                    0.0,
+                    0.0,
+                    old.theme_instance_id,
+                )
+                self.state.records[path_id] = record
+                records.append(record)
             else:
                 records.append(LifecycleRecord(
-                    path_id, old.theme_instance_id, timestamp,
-                    "death", "inactive",
+                    path_id,
+                    old.theme_instance_id,
+                    timestamp,
+                    "death",
+                    "inactive",
                     prior.age_frames if prior else 1,
                     prior.duration_minutes if prior else frame_minutes,
-                    0.0, 0.0, old.theme_instance_id,
+                    0.0,
+                    0.0,
+                    old.theme_instance_id,
                 ))
                 self.state.clear(path_id)
         return assigned, records
