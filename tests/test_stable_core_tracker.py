@@ -40,7 +40,7 @@ def test_birth_confirmation_and_dormant_revival():
     assert records2[0].event_type == "continuation"
     assert second[0].theme_path_id == first[0].theme_path_id
 
-    empty, records3 = tracker.assign(
+    _, records3 = tracker.assign(
         [],
         second,
         {records2[0].theme_instance_id: records2[0]},
@@ -48,6 +48,16 @@ def test_birth_confirmation_and_dormant_revival():
         frame_minutes=1,
     )
     assert any(record.status == "dormant" for record in records3)
+
+    revived, records4 = tracker.assign(
+        [theme("i4", "new-4", [1, 2, 3, 6])],
+        [],
+        {},
+        timestamp=pd.Timestamp("2026-01-07 15:13", tz="UTC"),
+        frame_minutes=1,
+    )
+    assert records4[0].event_type == "revival"
+    assert revived[0].theme_path_id == first[0].theme_path_id
 
 
 def test_global_matching_does_not_reuse_path():
@@ -57,7 +67,7 @@ def test_global_matching_does_not_reuse_path():
         theme("c1", "new-1", [1, 2, 3]),
         theme("c2", "new-2", [1, 2, 4]),
     ]
-    assigned, records = tracker.assign(
+    assigned, _ = tracker.assign(
         current,
         previous,
         {},
