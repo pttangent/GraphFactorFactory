@@ -23,6 +23,7 @@ class BuildConfig:
     horizons_minutes: tuple[int, ...] = (5, 15, 30, 60, 120)
     store_labels: bool = True
     store_qlib_cache: bool = False
+    split_csv_path: str | None = None
     parquet_compression: str = "zstd"
     parquet_compression_level: int = 6
 
