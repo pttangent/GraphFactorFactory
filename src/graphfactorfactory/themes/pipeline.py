@@ -12,6 +12,16 @@ from .temporal import ThemeLifecycleTracker
 from .temporal_edges import TemporalEdgeConfig, TemporalEdgeReplay
 
 
+import time
+import logging
+from concurrent.futures import ProcessPoolExecutor
+
+logger = logging.getLogger(__name__)
+
+def _process_layer(args):
+    detector, layer_edges, layer_id, name, snapshot_time, universe_count = args
+    return detector.detect_hierarchy(layer_edges, layer_id=layer_id, layer_name=name, snapshot_time=snapshot_time, universe_count=universe_count)
+
 @dataclass(frozen=True)
 class ThemeDiscoveryConfig:
     run_id: str = "gff_theme_run"
@@ -52,26 +62,35 @@ class ThemeDiscoveryPipeline:
         previous = []
         previous_records = {}
         outputs = []
-        for day in sorted((self.graph_root / "canonical").glob("date=*")):
-            trade_date = day.name.split("=", 1)[1]
-            if date_start and trade_date < date_start:
-                continue
-            if date_end and trade_date > date_end:
-                continue
-            edges = pd.read_parquet(day / "edges.parquet")
-            nodes = pd.read_parquet(day / "node_features.parquet")
-            for snapshot_time, raw_snapshot_edges in edges.groupby("decision_time", sort=True):
-                snapshot_edges = self.temporal_edges.replay(raw_snapshot_edges, snapshot_time)
-                layer_communities = []
-                subcommunities = []
-                for layer_id, layer_edges in snapshot_edges.groupby("layer_id"):
-                    layer_id = int(layer_id)
-                    if layer_id == 0:
-                        continue
-                    name = self.layer_name.get(layer_id, str(layer_id))
-                    parents, children = self.detector.detect_hierarchy(layer_edges, layer_id=layer_id, layer_name=name, snapshot_time=snapshot_time, universe_count=universe_count)
-                    layer_communities.extend(parents)
-                    subcommunities.extend(children)
+        logger.info(f"Starting Sequential Theme Discovery with 13x parallel layer processing (Universe: {universe_count})...")
+        with ProcessPoolExecutor(max_workers=13) as executor:
+            for day in sorted((self.graph_root / "canonical").glob("date=*")):
+                trade_date = day.name.split("=", 1)[1]
+                if date_start and trade_date < date_start:
+                    continue
+                if date_end and trade_date > date_end:
+                    continue
+                
+                logger.info(f"[{trade_date}] Starting Theme Discovery...")
+                t0 = time.time()
+                edges = pd.read_parquet(day / "edges.parquet")
+                nodes = pd.read_parquet(day / "node_features.parquet")
+                for snapshot_time, raw_snapshot_edges in edges.groupby("decision_time", sort=True):
+                    snapshot_edges = self.temporal_edges.replay(raw_snapshot_edges, snapshot_time)
+                    
+                    layer_tasks = []
+                    for layer_id, layer_edges in snapshot_edges.groupby("layer_id"):
+                        layer_id = int(layer_id)
+                        if layer_id == 0:
+                            continue
+                        name = self.layer_name.get(layer_id, str(layer_id))
+                        layer_tasks.append((self.detector, layer_edges, layer_id, name, snapshot_time, universe_count))
+                    
+                    layer_communities = []
+                    subcommunities = []
+                    for parents, children in executor.map(_process_layer, layer_tasks):
+                        layer_communities.extend(parents)
+                        subcommunities.extend(children)
                 candidates = self.consensus.build(layer_communities, snapshot_time=snapshot_time, run_id=self.config.run_id, universe_count=universe_count)
                 candidates, lifecycle = self.lifecycle.assign(candidates, previous, previous_records, timestamp=snapshot_time, frame_minutes=self.config.frame_minutes)
                 semantics = self.semantic.label(candidates)
@@ -81,5 +100,6 @@ class ThemeDiscoveryPipeline:
                 outputs.append(target)
                 previous = candidates
                 previous_records = {record.theme_instance_id: record for record in lifecycle if record.status == "active"}
+            logger.info(f"[{trade_date}] Finished Theme Discovery in {time.time() - t0:.1f}s")
         self.store.build_read_models()
         return outputs
