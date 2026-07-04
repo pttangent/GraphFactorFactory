@@ -26,15 +26,11 @@ class MultilayerGraphBuilder:
         self.symbols = ordered["symbol"].astype(str).tolist()
         self.symbol_ids = ordered["symbol_id"].astype("int32").to_numpy()
 
-    def build_snapshot(self, events: pd.DataFrame, decision_time) -> SnapshotProducts:
+    def build_snapshot(self, window: pd.DataFrame, decision_time) -> SnapshotProducts:
         started = time.perf_counter()
         decision_time = pd.Timestamp(decision_time)
         decision_time = decision_time.tz_localize("UTC") if decision_time.tzinfo is None else decision_time.tz_convert("UTC")
         window_start = decision_time - pd.Timedelta(minutes=self.config.graph_window_minutes)
-        data = events[events["symbol"].isin(self.symbols)].copy()
-        data["timestamp"] = pd.to_datetime(data["timestamp"], utc=True)
-        data["available_time"] = pd.to_datetime(data["available_time"], utc=True)
-        window = data[(data["available_time"] <= decision_time) & (data["timestamp"] <= decision_time) & (data["timestamp"] > window_start)]
         current = window.sort_values(["available_time", "timestamp"]).groupby("symbol").tail(1).set_index("symbol").reindex(self.symbols)
         reversal = -zscore(current["ret_5m"].to_numpy(dtype=np.float32))
         flow_column = "signed_dollar_flow" if "signed_dollar_flow" in current.columns else "signed_dollar_flow_proxy"

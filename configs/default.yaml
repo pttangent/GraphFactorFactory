@@ -1,9 +1,9 @@
-frequency: 5min
+frequency: 1min
 market_timezone: America/New_York
 market_open: "09:30"
 market_close: "16:00"
 graph_window_minutes: 60
-graph_step_minutes: 15
+graph_step_minutes: 1
 top_k: 8
 degree_cap: 6
 minimum_similarity: 0.10

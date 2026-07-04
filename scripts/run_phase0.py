@@ -50,11 +50,10 @@ def monitor_worker(worker_name: str, pid: int, start_time: float, result_dict: d
         logger.error(f"Error monitoring {worker_name}: {e}")
 
 
-def process_graph_date(args):
-    trade_date, month, temp_monthpack_dir, output_dir, config_path, lock = args
+def process_graph_date(trade_date, month, temp_monthpack_dir, output_dir, config_path, lock, max_threads=13, executor=None):
     start_time = time.time()
     pid = os.getpid()
-    logger.info(f"[Graph Worker {pid}] Starting date {trade_date}")
+    logger.info(f"[Graph Worker {pid}] Starting date {trade_date} with {max_threads} threads")
     
     # We will self-monitor by launching a thread
     stats = {}
@@ -76,7 +75,8 @@ def process_graph_date(args):
 
         store = LockedCanonicalGraphStore(output_dir, config)
         pipeline = GraphFactorPipeline(source, store, config)
-        result = pipeline.build_date(trade_date)
+        pipeline.max_threads = max_threads
+        result = pipeline.build_date(trade_date, executor=executor)
         return {"trade_date": trade_date, "success": True, "result": result, "stats": stats}
     except Exception as e:
         import traceback
@@ -159,23 +159,27 @@ def push_dashboard_loop(output_dir: Path):
                 logger.error(f"[Dashboard Push] Failed to push dashboard: {e}")
 
 def main():
+    import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--source-monthpack-root", default=r"P:\US-Stock\NodeFactorFactory\warehouse\month_packs")
     parser.add_argument("--temp-monthpack-root", default=r"C:\nodefactor_work\month_packs")
     parser.add_argument("--output-root", default=r"D:\DEV\US-Stock\GraphFactorFactory\data\graph_store")
     parser.add_argument("--target-month", default="2026-06")
-    parser.add_argument("--next-month", default="2026-05")
+    parser.add_argument("--target-date", default=None, help="Process only a specific date (e.g., 2026-06-01)")
+    parser.add_argument("--next-month", default="2026-07")
     parser.add_argument("--config", default=r"D:\DEV\US-Stock\GraphFactorFactory\configs\default.yaml")
-    parser.add_argument("--workers", type=int, default=max(1, multiprocessing.cpu_count() - 2))
-    parser.add_argument("--skip-copy", action="store_true", default=True, help="Skip copying from HDD (assume user manually copied data)")
+    parser.add_argument("--workers", type=int, default=26)
+    parser.add_argument("--skip-copy", action="store_true", default=True)
+    parser.add_argument("--force-rebuild", action="store_true", help="Force rebuild even if graph store exists")
+    parser.add_argument("--max-workers", type=int, default=26, help="Max workers for ProcessPoolExecutor")
     args = parser.parse_args()
-
-    source_root = Path(args.source_monthpack_root)
-    temp_root = Path(args.temp_monthpack_root)
+    
     output_root = Path(args.output_root)
-
-    # Initialize dashboard immediately so user can see status
     output_root.mkdir(parents=True, exist_ok=True)
+    temp_root = Path(args.temp_monthpack_root)
+    source_root = Path(args.source_monthpack_root)
+    
+    # Initialize dashboard immediately so user can see status
     update_dashboard(output_root, args.target_month, [], [])
 
     # Start the 5-minute auto-push thread
@@ -191,29 +195,49 @@ def main():
     background_copy_month(source_root, temp_root, args.target_month, force_skip=args.skip_copy)
 
     pack_source = MonthPackNodeFactorSource(temp_root)
-    dates = pack_source.available_dates(args.target_month)
-    if not dates:
-        logger.error(f"No dates found for {args.target_month} in {temp_root}")
-        return
-
-    logger.info(f"Found {len(dates)} dates for {args.target_month}. Starting Graph Pipeline with {args.workers} workers...")
     
-    manager = multiprocessing.Manager()
-    lock = manager.Lock()
+    if args.target_date:
+        dates = [d for d in pack_source.available_dates(args.target_month) if d == args.target_date]
+    else:
+        dates = pack_source.available_dates(args.target_month)
+    
+    canonical_dir = output_root / "canonical"
+    pending_dates = []
+    for d in dates:
+        if (canonical_dir / f"date={d}" / "edges.parquet").exists() and (canonical_dir / f"date={d}" / "edges.parquet").stat().st_size > 0:
+            logger.info(f"Skipping graph generation for {d}, already exists.")
+        else:
+            pending_dates.append(d)
+    
+    dates = pending_dates
+    
+    if not dates:
+        logger.warning(f"No missing graph data for month {args.target_month}, skipping Graph Pipeline.")
+        graph_results = []
+    else:
+        logger.info(f"Generating Canonical Graphs for {len(dates)} days sequentially (Parallelizing inner snapshots with {args.workers} workers)...")
+        # Dummy lock since we don't have multiple processes for days anymore
+        class DummyLock:
+            def __enter__(self): pass
+            def __exit__(self, *args): pass
+        
+        lock = DummyLock()
+        graph_results = []
+        
+        from concurrent.futures import ProcessPoolExecutor
+        with ProcessPoolExecutor(max_workers=args.workers) as executor:
+            for d in dates:
+                res = process_graph_date(d, args.target_month, str(temp_root), str(output_root), args.config, lock, args.workers, executor=executor)
+                graph_results.append(res)
+                update_dashboard(output_root, args.target_month, graph_results, [])
 
-    graph_results = []
-    with concurrent.futures.ProcessPoolExecutor(max_workers=args.workers) as executor:
-        futures = {executor.submit(process_graph_date, (d, args.target_month, str(temp_root), str(output_root), args.config, lock)): d for d in dates}
-        for future in concurrent.futures.as_completed(futures):
-            res = future.result()
-            graph_results.append(res)
-            update_dashboard(output_root, args.target_month, graph_results, [])
-
-    # Check for graph failures
-    failed = [r["trade_date"] for r in graph_results if not r["success"]]
-    if failed:
-        logger.error(f"Graph Pipeline failed for dates: {failed}. Aborting Themes.")
-        return
+        # Check for graph failures
+        failed = [r["trade_date"] for r in graph_results if not r["success"]]
+        if failed:
+            logger.error(f"Graph Pipeline failed for dates: {failed}. Aborting Themes.")
+            for r in graph_results:
+                if not r["success"]: logger.error(f"Error for {r['trade_date']}: {r.get('error', '')}\n{r.get('traceback', '')}")
+            return
 
     # 3. Sequential Theme Pipeline
     logger.info("Graph Pipeline completed successfully.")
@@ -221,14 +245,16 @@ def main():
     config = BuildConfig.from_yaml(args.config) if args.config else BuildConfig()
     CanonicalGraphStore(output_root, config).finalize_catalog()
 
-    # 4. Run Theme Discovery Phase (Sequential because DuckDB takes huge memory)
-    theme_config = ThemeDiscoveryConfig(run_id=f"run_{args.target_month}")
-    # Using the same output_root for themes as per standard architecture
+    # 4. Run Theme Discovery Phase
+    theme_config = ThemeDiscoveryConfig(run_id=f"run_{args.target_month}", frame_minutes=5)
     theme_pipeline = ThemeDiscoveryPipeline(output_root, output_root / "themes", theme_config)
-    
+    logger.info("Starting Two-Pass Theme Discovery Pipeline...")
     theme_start_time = time.time()
-    # Execute theme discovery
-    theme_results = theme_pipeline.run(date_start=f"{args.target_month}-01", date_end=f"{args.target_month}-31")
+    # Use max_workers to saturate the machine
+    if args.target_date:
+        theme_results = theme_pipeline.run(date_start=args.target_date, date_end=args.target_date, max_workers=args.max_workers)
+    else:
+        theme_results = theme_pipeline.run(date_start=f"{args.target_month}-01", date_end=f"{args.target_month}-31", max_workers=args.max_workers)
     theme_elapsed = time.time() - theme_start_time
     logger.info(f"Theme Pipeline complete in {theme_elapsed:.2f}s.")
 
