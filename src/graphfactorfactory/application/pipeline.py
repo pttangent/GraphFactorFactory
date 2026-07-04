@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-from pathlib import Path
-
 import pandas as pd
 
+from graphfactorfactory.application.adjusted_labels import build_split_adjusted_labels
 from graphfactorfactory.application.causality import audit_source_events
 from graphfactorfactory.application.graph import MultilayerGraphBuilder
 from graphfactorfactory.application.labels import build_forward_labels
@@ -11,8 +10,9 @@ from graphfactorfactory.application.pit import build_point_in_time_panel, decisi
 from graphfactorfactory.domain.config import BuildConfig
 from graphfactorfactory.domain.layers import LAYERS
 from graphfactorfactory.domain.records import BuildResult
-from graphfactorfactory.ports.node_source import NodeFactorSource
+from graphfactorfactory.infrastructure.corporate_actions import SplitAdjustmentSource
 from graphfactorfactory.infrastructure.store import CanonicalGraphStore
+from graphfactorfactory.ports.node_source import NodeFactorSource
 
 
 class GraphFactorPipeline:
@@ -38,10 +38,15 @@ class GraphFactorPipeline:
         self.store.initialize_dimensions(symbols, layers)
         panel = build_point_in_time_panel(events, self.config)
         symbol_lookup = dict(zip(symbols["symbol"], symbols["symbol_id"]))
+        split_source = SplitAdjustmentSource(self.config.split_csv_path) if self.config.split_csv_path else None
         label_rows = 0
         with self.store.open_day(trade_date) as writer:
             if self.config.store_labels:
-                labels = build_forward_labels(panel, self.config.horizons_minutes)
+                labels = (
+                    build_split_adjusted_labels(panel, self.config.horizons_minutes, split_source)
+                    if split_source is not None
+                    else build_forward_labels(panel, self.config.horizons_minutes)
+                )
                 labels["symbol_id"] = labels["symbol"].map(symbol_lookup).astype("int32")
                 writer.write_labels(labels.drop(columns="symbol"))
                 label_rows = len(labels)
@@ -54,6 +59,13 @@ class GraphFactorPipeline:
                 writer.write_node_features(products.node_features)
                 writer.write_snapshots(products.snapshots)
         catalog = self.store.finalize_catalog()
-        manifest = self.store.write_manifest(trade_date=trade_date, source_fingerprint=self.source.fingerprint(), config=self.config, universe_count=len(universe), node_feature_columns=self.source.numeric_feature_columns())
+        manifest = self.store.write_manifest(
+            trade_date=trade_date,
+            source_fingerprint=self.source.fingerprint(),
+            config=self.config,
+            universe_count=len(universe),
+            node_feature_columns=self.source.numeric_feature_columns(),
+            split_source_metadata=split_source.metadata if split_source else None,
+        )
         counts = self.store.count_date_rows(trade_date)
         return BuildResult(root=self.store.root, manifest_path=manifest, catalog_path=catalog, edge_rows=counts["edges"], node_feature_rows=counts["node_features"], snapshot_rows=counts["snapshots"], label_rows=label_rows)
