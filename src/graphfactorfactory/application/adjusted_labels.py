@@ -9,17 +9,13 @@ def build_split_adjusted_labels(panel, horizons_minutes, split_source, bar_minut
     prices = base.rename(columns={"decision_time": "price_time", "close": "price"})
     result = base[["decision_time", "symbol"]].copy()
     entry_time = result["decision_time"] + pd.Timedelta(minutes=bar_minutes)
-    entry_price = result.assign(price_time=entry_time).merge(
-        prices, on=["symbol", "price_time"], how="left", validate="many_to_one"
-    )["price"]
+    entry_price = result.assign(price_time=entry_time).merge(prices, on=["symbol", "price_time"], how="left", validate="many_to_one")["price"]
     result["label_entry_time"] = entry_time
     result["label_entry_price"] = entry_price.astype("float32")
     result["label_adjustment_policy"] = "split_adjusted_target_only"
     for horizon in horizons_minutes:
         exit_time = entry_time + pd.Timedelta(minutes=horizon)
-        exit_price = result[["decision_time", "symbol"]].assign(price_time=exit_time).merge(
-            prices, on=["symbol", "price_time"], how="left", validate="many_to_one"
-        )["price"]
+        exit_price = result[["decision_time", "symbol"]].assign(price_time=exit_time).merge(prices, on=["symbol", "price_time"], how="left", validate="many_to_one")["price"]
         multiplier = split_source.cumulative_multiplier(result["symbol"], entry_time, exit_time)
         result[f"label_exit_time_{horizon}m"] = exit_time
         result[f"label_exit_price_raw_{horizon}m"] = exit_price.astype("float32")

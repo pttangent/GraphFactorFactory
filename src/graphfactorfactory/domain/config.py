@@ -29,9 +29,18 @@ class BuildConfig:
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> "BuildConfig":
-        raw = yaml.safe_load(Path(path).read_text()) or {}
+        config_path = Path(path).expanduser().resolve()
+        raw = yaml.safe_load(config_path.read_text()) or {}
         if "horizons_minutes" in raw:
             raw["horizons_minutes"] = tuple(int(value) for value in raw["horizons_minutes"])
+        split_path = raw.get("split_csv_path")
+        if split_path:
+            candidate = Path(split_path).expanduser()
+            if not candidate.is_absolute():
+                repo_relative = (config_path.parent.parent / candidate).resolve()
+                config_relative = (config_path.parent / candidate).resolve()
+                candidate = repo_relative if repo_relative.exists() else config_relative
+            raw["split_csv_path"] = str(candidate)
         return cls(**raw)
 
     def to_dict(self) -> dict:

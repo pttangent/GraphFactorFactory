@@ -11,6 +11,6 @@ minimum_window_points: 8
 horizons_minutes: [5, 15, 30, 60, 120]
 store_labels: true
 store_qlib_cache: false
-split_csv_path: data/splits.csv
+split_csv_path: data/splits.csv.gz
 parquet_compression: zstd
 parquet_compression_level: 6

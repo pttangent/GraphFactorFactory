@@ -42,11 +42,7 @@ class GraphFactorPipeline:
         label_rows = 0
         with self.store.open_day(trade_date) as writer:
             if self.config.store_labels:
-                labels = (
-                    build_split_adjusted_labels(panel, self.config.horizons_minutes, split_source)
-                    if split_source is not None
-                    else build_forward_labels(panel, self.config.horizons_minutes)
-                )
+                labels = build_split_adjusted_labels(panel, self.config.horizons_minutes, split_source) if split_source else build_forward_labels(panel, self.config.horizons_minutes)
                 labels["symbol_id"] = labels["symbol"].map(symbol_lookup).astype("int32")
                 writer.write_labels(labels.drop(columns="symbol"))
                 label_rows = len(labels)
@@ -59,13 +55,6 @@ class GraphFactorPipeline:
                 writer.write_node_features(products.node_features)
                 writer.write_snapshots(products.snapshots)
         catalog = self.store.finalize_catalog()
-        manifest = self.store.write_manifest(
-            trade_date=trade_date,
-            source_fingerprint=self.source.fingerprint(),
-            config=self.config,
-            universe_count=len(universe),
-            node_feature_columns=self.source.numeric_feature_columns(),
-            split_source_metadata=split_source.metadata if split_source else None,
-        )
+        manifest = self.store.write_manifest(trade_date=trade_date, source_fingerprint=self.source.fingerprint(), config=self.config, universe_count=len(universe), node_feature_columns=self.source.numeric_feature_columns(), split_source_metadata=split_source.metadata if split_source else None)
         counts = self.store.count_date_rows(trade_date)
         return BuildResult(root=self.store.root, manifest_path=manifest, catalog_path=catalog, edge_rows=counts["edges"], node_feature_rows=counts["node_features"], snapshot_rows=counts["snapshots"], label_rows=label_rows)

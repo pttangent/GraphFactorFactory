@@ -19,8 +19,6 @@ class SplitSourceMetadata:
 
 
 class SplitAdjustmentSource:
-    """Read split events with columns symbol,date,from,to."""
-
     REQUIRED_COLUMNS = {"symbol", "date", "from", "to"}
 
     def __init__(self, csv_path: str | Path):
@@ -44,9 +42,9 @@ class SplitAdjustmentSource:
         frame["ratio_key"] = frame["share_multiplier"].round(12)
         deduplicated = frame.drop_duplicates(["symbol", "effective_date", "ratio_key"])
         self.collapsed_duplicate_ratio_count = int(len(frame) - len(deduplicated))
-        normalized = (
-            deduplicated.groupby(["symbol", "effective_date"], as_index=False)
-            .agg(share_multiplier=("share_multiplier", "prod"), component_count=("share_multiplier", "size"))
+        normalized = deduplicated.groupby(["symbol", "effective_date"], as_index=False).agg(
+            share_multiplier=("share_multiplier", "prod"),
+            component_count=("share_multiplier", "size"),
         )
         self.frame = normalized.sort_values(["symbol", "effective_date"]).reset_index(drop=True)
 
