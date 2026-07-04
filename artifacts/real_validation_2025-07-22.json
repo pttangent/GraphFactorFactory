@@ -1,0 +1,42 @@
+{
+  "trade_date": "2025-07-22",
+  "source_universe": 5247,
+  "graph_step_minutes_smoke": 120,
+  "graph_layers": 13,
+  "edge_rows": 383115,
+  "node_feature_rows": 220374,
+  "snapshot_rows": 39,
+  "label_rows": 384415,
+  "qlib": {
+    "loader_shape": [118459, 156],
+    "feature_count": 151,
+    "label_count": 5,
+    "prepared_shape": [13507, 156],
+    "seconds": 29.337428544999966
+  },
+  "prefix_invariance": {
+    "decision_time": "2025-07-22 18:00:00+00:00",
+    "prefix_invariance": true,
+    "future_available_rows": 99803
+  },
+  "capacity_projection": {
+    "actual_smoke_snapshots": 3,
+    "actual_smoke_files_bytes": {
+      "edges.parquet": 3336384,
+      "node_features.parquet": 4452990,
+      "snapshots.parquet": 12032,
+      "labels.parquet": 12751829
+    },
+    "projected_full_15m_snapshots": 27,
+    "projected_full_day_canonical_bytes": 82964483,
+    "projected_annual_canonical_bytes": 20907049716,
+    "projected_three_year_canonical_bytes": 62721149148,
+    "projected_three_year_plus_50pct_bytes": 94081723722,
+    "labels_disabled_three_year_plus_50pct_bytes": 79621149636
+  },
+  "storage_policy": {
+    "nodefactorfactory_source": "external_not_duplicated",
+    "canonical_graph_store": "lossless_retained_edges_nodes_snapshots",
+    "qlib": "on_demand_view_not_materialized_by_default"
+  }
+}

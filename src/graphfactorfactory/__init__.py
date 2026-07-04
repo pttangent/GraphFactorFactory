@@ -1,4 +1,9 @@
-from .core import BuildConfig, LAYERS, MultilayerGraphBuilder, audit_pit_frame, build_forward_labels, build_point_in_time_panel
-from .qlib_adapter import GraphFactorDataLoader, discover_numeric_features, export_qlib_table
+"""GraphFactorFactory public API."""
 
-__version__ = "0.2.0"
+from graphfactorfactory.domain.config import BuildConfig
+from graphfactorfactory.domain.layers import LAYERS
+from graphfactorfactory.application.pipeline import GraphFactorPipeline
+from graphfactorfactory.infrastructure.qlib import CanonicalQlibDataLoader, GraphBatchProvider
+
+__all__ = ["BuildConfig", "LAYERS", "GraphFactorPipeline", "CanonicalQlibDataLoader", "GraphBatchProvider"]
+__version__ = "0.3.0"
