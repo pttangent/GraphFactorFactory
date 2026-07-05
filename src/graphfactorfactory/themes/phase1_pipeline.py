@@ -22,7 +22,10 @@ def _leaf_communities(parents, children):
     return [p for p in parents if p.community_id not in split_ids] + list(children)
 
 def _process_theme_chunk(args):
-    chunk_times, chunk_edges, detector, consensus_builder, layer_names, universe_count, run_id = args
+    day_path, chunk_times, detector, consensus_builder, layer_names, universe_count, run_id = args
+    import pyarrow.parquet as pq
+    table = pq.read_table(day_path / "edges.parquet", filters=[("decision_time", "in", chunk_times)])
+    chunk_edges = table.to_pandas()
     results = []
     for snapshot_time in chunk_times:
         snapshot_edges = chunk_edges[chunk_edges["decision_time"] == snapshot_time]
@@ -113,8 +116,8 @@ class ThemeDiscoveryPhase1Pipeline:
         universe_count = len(symbols)
         outputs = []
 
-        from concurrent.futures import ThreadPoolExecutor
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        from concurrent.futures import ProcessPoolExecutor
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
             for day in sorted((self.graph_root / "canonical").glob("date=*")):
                 trade_date = day.name.split("=", 1)[1]
                 if date_start and trade_date < date_start:
@@ -129,9 +132,14 @@ class ThemeDiscoveryPhase1Pipeline:
                     continue
 
                 t0 = time.time()
-                edges = pd.read_parquet(day / "edges.parquet")
+                # Read only what we need to get times
+                import pyarrow.parquet as pq
+                meta = pq.read_metadata(day / "edges.parquet")
+                schema = pq.read_schema(day / "edges.parquet")
+                # Alternatively just read decision_time
+                snapshot_times = sorted(pq.read_table(day / "edges.parquet", columns=["decision_time"]).to_pandas()["decision_time"].unique())
+                
                 nodes = pd.read_parquet(day / "node_features.parquet")
-                snapshot_times = sorted(edges["decision_time"].unique())
                 nodes_map = {t: nodes[nodes.decision_time == t] for t in snapshot_times}
 
                 chunks = np.array_split(snapshot_times, max_workers)
@@ -140,8 +148,7 @@ class ThemeDiscoveryPhase1Pipeline:
                     if len(chunk) == 0:
                         continue
                     times = list(chunk)
-                    chunk_edges = edges[edges["decision_time"].isin(times)].copy()
-                    tasks.append((times, chunk_edges, self.detector, self.consensus, self.layer_name, universe_count, self.config.run_id))
+                    tasks.append((day, times, self.detector, self.consensus, self.layer_name, universe_count, self.config.run_id))
 
                 precomputed = {t: (None, [], []) for t in snapshot_times}
                 
