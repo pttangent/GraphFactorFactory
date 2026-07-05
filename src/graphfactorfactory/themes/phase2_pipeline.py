@@ -25,15 +25,21 @@ def _atomic_parquet(frame: pd.DataFrame, path: Path) -> None:
     os.replace(temp, path)
 
 
-def _json_value(value: Any) -> Any:
+def _tuple_value(value: Any) -> tuple:
+    if value is None:
+        return ()
+    if isinstance(value, float) and pd.isna(value):
+        return ()
     if isinstance(value, np.ndarray):
-        return value.tolist()
+        return tuple(value.tolist())
+    if isinstance(value, list):
+        return tuple(value)
     if isinstance(value, tuple):
-        return list(value)
-    return value
+        return value
+    return (value,)
 
 
-def _candidate_from_layer_row(row: pd.Series, run_id: str) -> ThemeCandidate:
+def _candidate_from_layer_row(row: pd.Series) -> ThemeCandidate:
     timestamp = pd.Timestamp(row["snapshot_time"])
     layer_id = int(row["layer_id"])
     layer_name = str(row["layer_name"])
@@ -51,7 +57,6 @@ def _candidate_from_layer_row(row: pd.Series, run_id: str) -> ThemeCandidate:
         structure_score=float(row.get("modularity", 0.0) or 0.0),
         member_ratio=0.0,
         is_market_mode=bool(row.get("is_market_mode", False)),
-        run_id=run_id,
     )
 
 
@@ -72,9 +77,9 @@ def _candidate_from_state_row(row: pd.Series) -> ThemeCandidate:
         theme_instance_id=str(row["theme_instance_id"]),
         theme_path_id=str(row["theme_path_id"]),
         snapshot_time=pd.Timestamp(row["snapshot_time"]),
-        members=tuple(int(item) for item in row["members"]),
-        source_layers=tuple(str(item) for item in row["source_layers"]),
-        source_families=tuple(str(item) for item in row["source_families"]),
+        members=tuple(int(item) for item in _tuple_value(row["members"])),
+        source_layers=tuple(str(item) for item in _tuple_value(row["source_layers"])),
+        source_families=tuple(str(item) for item in _tuple_value(row["source_families"])),
         consensus_score=float(row.get("consensus_score", 0.0)),
         structure_score=float(row.get("structure_score", 0.0)),
         member_ratio=float(row.get("member_ratio", 0.0)),
@@ -88,6 +93,7 @@ def _candidate_from_state_row(row: pd.Series) -> ThemeCandidate:
 
 
 def _record_from_state_row(row: pd.Series) -> LifecycleRecord:
+    previous = row.get("previous_theme_instance_id")
     return LifecycleRecord(
         theme_path_id=str(row["theme_path_id"]),
         theme_instance_id=str(row["theme_instance_id"]),
@@ -98,9 +104,9 @@ def _record_from_state_row(row: pd.Series) -> LifecycleRecord:
         duration_minutes=int(row["duration_minutes"]),
         match_score=float(row["match_score"]),
         member_retention=float(row["member_retention"]),
-        previous_theme_instance_id=(None if pd.isna(row.get("previous_theme_instance_id")) else str(row.get("previous_theme_instance_id"))),
-        parent_path_ids=tuple(row.get("parent_path_ids", ()) or ()),
-        child_path_ids=tuple(row.get("child_path_ids", ()) or ()),
+        previous_theme_instance_id=(None if previous is None or (isinstance(previous, float) and pd.isna(previous)) else str(previous)),
+        parent_path_ids=tuple(str(item) for item in _tuple_value(row.get("parent_path_ids"))),
+        child_path_ids=tuple(str(item) for item in _tuple_value(row.get("child_path_ids"))),
     )
 
 
@@ -140,6 +146,7 @@ class ThemeStorePhase2:
         return target
 
     def mark_day_success(self, trade_date: str) -> None:
+        self.day_dir(trade_date).mkdir(parents=True, exist_ok=True)
         (self.day_dir(trade_date) / "_SUCCESS").write_text("success\n", encoding="utf-8")
         state_day = self.state_root / f"date={trade_date}"
         state_day.mkdir(parents=True, exist_ok=True)
@@ -172,20 +179,14 @@ class ThemeStorePhase2:
 
     def invalidate_from(self, trade_date: str) -> None:
         for root in (self.root, self.state_root):
-            for day in root.glob("date=*" ):
+            for day in root.glob("date=*"):
                 current = day.name.split("=", 1)[1]
                 if current >= trade_date:
                     shutil.rmtree(day, ignore_errors=True)
 
 
 class ThemeTemporalPhase2Pipeline:
-    """Stateful Phase 2.
-
-    Phase 0 and Phase 1 outputs are immutable inputs. Phase 2 may be rebuilt from
-    any earliest affected date; the previous trading day's serialized state is
-    loaded automatically when available, and every later date is recomputed in
-    strict chronological order.
-    """
+    """Stateful and restartable temporal linking over immutable Phase 1 output."""
 
     def __init__(self, phase1_root: str | Path, phase2_root: str | Path, config: ThemeDiscoveryConfig):
         self.phase1_root = Path(phase1_root).expanduser().resolve()
@@ -250,7 +251,7 @@ class ThemeTemporalPhase2Pipeline:
                 all_records: list[LifecycleRecord] = []
 
                 for timestamp, snapshot in layer_frame.groupby("snapshot_time", sort=True):
-                    current = [_candidate_from_layer_row(row, self.config.run_id) for _, row in snapshot.iterrows()]
+                    current = [_candidate_from_layer_row(row) for _, row in snapshot.iterrows()]
                     assigned, records = tracker.assign(
                         current,
                         previous_candidates,
