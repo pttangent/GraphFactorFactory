@@ -172,6 +172,7 @@ def main():
     parser.add_argument("--skip-copy", action="store_true", default=True)
     parser.add_argument("--force-rebuild", action="store_true", help="Force rebuild even if graph store exists")
     parser.add_argument("--max-workers", type=int, default=26, help="Max workers for ProcessPoolExecutor")
+    parser.add_argument("--skip-themes", action="store_true", help="Skip Phase 1 Theme Discovery")
     args = parser.parse_args()
     
     output_root = Path(args.output_root)
@@ -225,7 +226,7 @@ def main():
         graph_results = []
         
         from concurrent.futures import ProcessPoolExecutor
-        with ProcessPoolExecutor(max_workers=args.workers) as executor:
+        with ProcessPoolExecutor(max_workers=args.workers, max_tasks_per_child=50) as executor:
             for d in dates:
                 res = process_graph_date(d, args.target_month, str(temp_root), str(output_root), args.config, lock, args.workers, executor=executor)
                 graph_results.append(res)
@@ -245,20 +246,23 @@ def main():
     config = BuildConfig.from_yaml(args.config) if args.config else BuildConfig()
     CanonicalGraphStore(output_root, config).finalize_catalog()
 
-    # 4. Run Theme Discovery Phase
-    theme_config = ThemeDiscoveryConfig(run_id=f"run_{args.target_month}", frame_minutes=5)
-    theme_pipeline = ThemeDiscoveryPipeline(output_root, output_root / "themes", theme_config)
-    logger.info("Starting Two-Pass Theme Discovery Pipeline...")
-    theme_start_time = time.time()
-    # Use max_workers to saturate the machine
-    if args.target_date:
-        theme_results = theme_pipeline.run(date_start=args.target_date, date_end=args.target_date, max_workers=args.max_workers)
+    # 4. Run Theme Discovery Phase (Optional)
+    if not args.skip_themes:
+        theme_config = ThemeDiscoveryConfig(run_id=f"run_{args.target_month}", frame_minutes=5)
+        theme_pipeline = ThemeDiscoveryPipeline(output_root, output_root / "themes", theme_config)
+        logger.info("Starting Two-Pass Theme Discovery Pipeline...")
+        theme_start_time = time.time()
+        # Use max_workers to saturate the machine
+        if args.target_date:
+            theme_results = theme_pipeline.run(date_start=args.target_date, date_end=args.target_date, max_workers=args.max_workers)
+        else:
+            theme_results = theme_pipeline.run(date_start=f"{args.target_month}-01", date_end=f"{args.target_month}-31", max_workers=args.max_workers)
+        theme_elapsed = time.time() - theme_start_time
+        logger.info(f"Theme Pipeline complete in {theme_elapsed:.2f}s.")
+        update_dashboard(output_root, args.target_month, graph_results, theme_results)
     else:
-        theme_results = theme_pipeline.run(date_start=f"{args.target_month}-01", date_end=f"{args.target_month}-31", max_workers=args.max_workers)
-    theme_elapsed = time.time() - theme_start_time
-    logger.info(f"Theme Pipeline complete in {theme_elapsed:.2f}s.")
-
-    update_dashboard(output_root, args.target_month, graph_results, theme_results)
+        logger.info("Skipping Theme Discovery (--skip-themes flag active).")
+        update_dashboard(output_root, args.target_month, graph_results, [])
     
     logger.info(f"Phase 0 completely finished for {args.target_month}.")
 
