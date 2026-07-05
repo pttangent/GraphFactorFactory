@@ -4,7 +4,7 @@ import multiprocessing
 import sys
 from pathlib import Path
 
-from graphfactorfactory.application.config import BuildConfig
+from graphfactorfactory.domain.config import BuildConfig
 from graphfactorfactory.themes.phase1_pipeline import ThemeDiscoveryPhase1Pipeline, ThemeDiscoveryConfig
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")

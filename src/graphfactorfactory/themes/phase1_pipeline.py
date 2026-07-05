@@ -113,7 +113,8 @@ class ThemeDiscoveryPhase1Pipeline:
         universe_count = len(symbols)
         outputs = []
 
-        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
             for day in sorted((self.graph_root / "canonical").glob("date=*")):
                 trade_date = day.name.split("=", 1)[1]
                 if date_start and trade_date < date_start:
