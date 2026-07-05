@@ -1,0 +1,89 @@
+{
+  "run_name": "carryover_fingerprint_ab_2025",
+  "date_start": "2025-01-01",
+  "date_end": "2025-12-31",
+  "input_root": "outputs/theme_discovery_phase1",
+  "output_root": "outputs/monthly_carryover_ab",
+  "min_community_size": 20,
+  "open_horizon_states": 30,
+  "random_seed": 202501,
+  "arms": {
+    "A": {
+      "entry_containment": 0.20,
+      "stay_containment": 0.20,
+      "fingerprint_confirm": null,
+      "assisted_stay_containment": null,
+      "assisted_stay_fingerprint": null,
+      "max_weak_gap": 0,
+      "revival": false
+    },
+    "B": {
+      "entry_containment": 0.18,
+      "stay_containment": 0.20,
+      "fingerprint_confirm": 0.10,
+      "assisted_stay_containment": null,
+      "assisted_stay_fingerprint": null,
+      "max_weak_gap": 0,
+      "revival": false
+    },
+    "C": {
+      "entry_containment": 0.18,
+      "stay_containment": 0.20,
+      "fingerprint_confirm": 0.10,
+      "assisted_stay_containment": 0.10,
+      "assisted_stay_fingerprint": 0.16,
+      "max_weak_gap": 1,
+      "revival": false
+    },
+    "D9": {
+      "inherit": "C",
+      "revival": true,
+      "pre_revival_active_states": 3,
+      "max_dormant_states": 3,
+      "max_revivals": 1,
+      "revival_fingerprint": 0.20,
+      "breadth_expansion": null
+    },
+    "D11": {
+      "inherit": "C",
+      "revival": true,
+      "pre_revival_active_states": 3,
+      "max_dormant_states": 3,
+      "max_revivals": 1,
+      "revival_fingerprint": 0.20,
+      "breadth_expansion": 0.10
+    },
+    "D13": {
+      "inherit": "C",
+      "revival": true,
+      "pre_revival_active_states": 3,
+      "max_dormant_states": 3,
+      "max_revivals": 1,
+      "revival_fingerprint": 0.22,
+      "breadth_expansion": 0.10
+    },
+    "D15": {
+      "inherit": "C",
+      "revival": true,
+      "pre_revival_active_states": 3,
+      "max_dormant_states": 3,
+      "max_revivals": 1,
+      "revival_fingerprint": 0.30,
+      "breadth_expansion": 0.10,
+      "post_revival_confirmation_states": 3
+    }
+  },
+  "controls": {
+    "day_order_nulls_per_boundary": 3,
+    "matched_open_birth": true,
+    "same_weekday_null": false,
+    "volatility_gap_matched_null": false
+  },
+  "survival_states": [3, 5, 10, 20],
+  "return_horizons_minutes": [5, 15, 30, 60],
+  "checkpoint": {
+    "atomic_unit": "overnight_boundary_x_arm_x_control",
+    "require_success_marker": true,
+    "skip_valid_completed": true
+  }
+}
