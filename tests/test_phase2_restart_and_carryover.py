@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import sys
 from pathlib import Path
 
 import pandas as pd
@@ -14,6 +15,7 @@ def load_script(name: str, relative: str):
     spec = importlib.util.spec_from_file_location(name, REPO_ROOT / relative)
     module = importlib.util.module_from_spec(spec)
     assert spec and spec.loader
+    sys.modules[name] = module
     spec.loader.exec_module(module)
     return module
 
