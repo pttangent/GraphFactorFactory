@@ -1,307 +1,450 @@
+from __future__ import annotations
+
 import argparse
 import json
 import math
 import os
-from collections import defaultdict, Counter
+from collections import Counter, defaultdict
 from pathlib import Path
-import numpy as np
+from typing import Any
+
 import pandas as pd
 import pyarrow.parquet as pq
-import pyarrow.compute as pc
-import pyarrow as pa
-import time
 
-MIN_SIZE = 20; H = 30
-ENTRY = 0.18; STAY = 0.20; LOW_STAY = 0.10
-FP_CONFIRM = 0.10; FP_STAY = 0.16; FP_REVIVE = 0.20
 
-def load_state_from_df(df, s):
-    # themes.parquet uses snapshot_time
-    z = df[df['snapshot_time'] == s]
-    out = []
-    for _, r in z.iterrows():
-        # r.members is a numpy array or list
-        mems = set(r.members)
-        if len(mems) < MIN_SIZE: continue
-        
-        # parse layer from source_layers (e.g., ["layer_1"])
-        layer_val = 0
-        if 'source_layers' in r and len(r.source_layers) > 0:
-            sl = r.source_layers[0]
-            if isinstance(sl, str) and sl.startswith("layer_"):
-                layer_val = int(sl.split("_")[1])
-        
-        out.append(dict(
-            id=r.theme_instance_id,
-            time=r.snapshot_time,
-            layer=layer_val,
-            size=len(mems),
-            members=mems,
-            core=mems # themes.parquet doesn't split core yet, use members
-        ))
-    return out
+def atomic_write(frame: pd.DataFrame, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_suffix(path.suffix + ".tmp")
+    frame.to_parquet(temp, index=False)
+    os.replace(temp, path)
 
-def containment(a, b): return len(a & b) / min(len(a), len(b)) if a and b else 0.
-def jaccard(a, b): return len(a & b) / len(a | b) if a and b else 0.
-def size_sim(a, b): return math.exp(-abs(math.log(max(1, a)) - math.log(max(1, b))) / 0.7)
 
-def fp_sim(proto, c):
-    core = containment(proto['core'], c['core'])
-    mem = containment(proto['members'], c['members'])
-    jac = jaccard(proto['members'], c['members'])
-    return .40 * core + .30 * mem + .15 * jac + .15 * size_sim(proto['mean_size'], c['size'])
+def as_members(value: Any) -> set[int]:
+    return {int(item) for item in value}
 
-def update_proto(proto, c):
-    p = dict(proto)
-    p['member_counts'] = Counter(proto['member_counts'])
-    p['core_counts'] = Counter(proto['core_counts'])
-    p['n'] += 1
-    p['member_counts'].update(c['members'])
-    p['core_counts'].update(c['core'])
-    p['members'] = {x for x, k in p['member_counts'].items() if k / p['n'] >= 0.35}
-    p['core'] = {x for x, k in p['core_counts'].items() if k / p['n'] >= 0.35}
-    p['mean_size'] = ((p['mean_size'] * (p['n'] - 1)) + c['size']) / p['n']
-    return p
 
-def init_proto(prev, openrow):
-    mc = Counter(prev['members'])
-    mc.update(openrow['members'])
-    cc = Counter(prev['core'])
-    cc.update(openrow['core'])
+def load_day(root: Path, trade_date: str, min_size: int) -> tuple[pd.DataFrame, list[pd.Timestamp]]:
+    path = root / f"date={trade_date}" / "layer_communities.parquet"
+    if not path.exists():
+        raise FileNotFoundError(path)
+    frame = pq.read_table(path).to_pandas()
+    required = {"snapshot_time", "layer_id", "layer_name", "community_id", "members"}
+    missing = required - set(frame.columns)
+    if missing:
+        raise ValueError(f"{path} missing columns: {sorted(missing)}")
+    frame = frame.copy()
+    frame["snapshot_time"] = pd.to_datetime(frame["snapshot_time"])
+    frame["size"] = frame["members"].map(len)
+    frame = frame[frame["size"] >= min_size]
+    frame = frame.sort_values(["snapshot_time", "layer_id", "community_id"], kind="mergesort")
+    return frame, sorted(frame["snapshot_time"].unique())
+
+
+def state_at(frame: pd.DataFrame, timestamp: pd.Timestamp) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for _, row in frame[frame["snapshot_time"] == timestamp].iterrows():
+        members = as_members(row["members"])
+        rows.append(
+            {
+                "id": f"{int(row['layer_id'])}:{pd.Timestamp(timestamp).isoformat()}:{int(row['community_id'])}",
+                "time": pd.Timestamp(timestamp),
+                "layer": int(row["layer_id"]),
+                "layer_name": str(row["layer_name"]),
+                "community_id": int(row["community_id"]),
+                "size": len(members),
+                "members": members,
+                "core": members,
+            }
+        )
+    return rows
+
+
+def containment(left: set[int], right: set[int]) -> float:
+    return len(left & right) / min(len(left), len(right)) if left and right else 0.0
+
+
+def jaccard(left: set[int], right: set[int]) -> float:
+    return len(left & right) / len(left | right) if left and right else 0.0
+
+
+def size_similarity(left: float, right: float) -> float:
+    return math.exp(-abs(math.log(max(1.0, left)) - math.log(max(1.0, right))) / 0.7)
+
+
+def fingerprint(proto: dict[str, Any], current: dict[str, Any]) -> float:
+    if int(proto["layer"]) != int(current["layer"]):
+        return 0.0
+    return (
+        0.40 * containment(proto["core"], current["core"])
+        + 0.30 * containment(proto["members"], current["members"])
+        + 0.15 * jaccard(proto["members"], current["members"])
+        + 0.15 * size_similarity(proto["mean_size"], current["size"])
+    )
+
+
+def init_proto(previous: dict[str, Any], opened: dict[str, Any]) -> dict[str, Any]:
+    member_counts = Counter(previous["members"])
+    member_counts.update(opened["members"])
+    core_counts = Counter(previous["core"])
+    core_counts.update(opened["core"])
     return {
-        'n': 2, 'member_counts': mc, 'core_counts': cc,
-        'members': set(prev['members']) | set(openrow['members']),
-        'core': set(prev['core']) | set(openrow['core']),
-        'mean_size': (prev['size'] + openrow['size']) / 2
+        "layer": previous["layer"],
+        "n": 2,
+        "member_counts": member_counts,
+        "core_counts": core_counts,
+        "members": set(previous["members"]) | set(opened["members"]),
+        "core": set(previous["core"]) | set(opened["core"]),
+        "mean_size": (previous["size"] + opened["size"]) / 2.0,
     }
 
-def bridge_candidates(prev, cur):
-    inv = defaultdict(list)
-    for j, c in enumerate(cur):
-        for n in c['members']: inv[n].append(j)
-    cand = []
-    for i, p in enumerate(prev):
-        cnt = defaultdict(int)
-        for n in p['members']:
-            for j in inv.get(n, ()): cnt[j] += 1
-        for j, k in cnt.items():
-            s = k / min(len(p['members']), len(cur[j]['members']))
-            if s >= ENTRY:
-                proto = {'members': p['members'], 'core': p['core'], 'mean_size': p['size']}
-                cand.append((s, fp_sim(proto, cur[j]), i, j))
-    cand.sort(reverse=True)
-    up = set(); uc = set(); out = []
-    for s, fp, i, j in cand:
-        if i in up or j in uc: continue
-        up.add(i); uc.add(j); out.append((i, j, s, fp))
-    return out
 
-def greedy_step(active, cur, variant_type, max_weak):
-    inv = defaultdict(list)
-    for j, c in enumerate(cur):
-        for n in c['members']: inv[n].append(j)
-    cand = []
-    for i, a in enumerate(active):
-        cnt = defaultdict(int)
-        for n in a['last']['members']:
-            for j in inv.get(n, ()): cnt[j] += 1
-        for j, k in cnt.items():
-            cont = k / min(len(a['last']['members']), len(cur[j]['members']))
-            fp = fp_sim(a['proto'], cur[j])
-            ok = False
-            if variant_type in ('A', 'B'): ok = cont >= STAY
-            elif variant_type in ('C', 'D'): ok = (cont >= LOW_STAY and fp >= FP_STAY) or cont >= STAY
-            if ok: cand.append((.65 * cont + .35 * fp, cont, fp, i, j))
-    cand.sort(reverse=True)
-    ua = set(); uc = set(); matches = {}
-    for score, cont, fp, i, j in cand:
-        if i in ua or j in uc: continue
-        ua.add(i); uc.add(j); matches[i] = (j, cont, fp)
-    return matches
+def update_proto(proto: dict[str, Any], current: dict[str, Any]) -> dict[str, Any]:
+    result = dict(proto)
+    result["member_counts"] = Counter(proto["member_counts"])
+    result["core_counts"] = Counter(proto["core_counts"])
+    result["n"] += 1
+    result["member_counts"].update(current["members"])
+    result["core_counts"].update(current["core"])
+    result["members"] = {item for item, count in result["member_counts"].items() if count / result["n"] >= 0.35}
+    result["core"] = {item for item, count in result["core_counts"].items() if count / result["n"] >= 0.35}
+    result["mean_size"] = ((proto["mean_size"] * proto["n"]) + current["size"]) / result["n"]
+    return result
 
-def follow(prev_roots, open_roots, future, variant_type, max_weak, max_dormant):
-    active = []
-    done = []
-    dormant = []
-    for p, o in zip(prev_roots, open_roots):
-        active.append({
-            'prev': p, 'root': o, 'last': o, 'proto': init_proto(p, o),
-            'age': 1, 'active_hits': 1, 'weak_gap': 0, 'dormant_gap': 0, 'revivals': 0, 'max_size': o['size']
-        })
-    for cur in future:
-        matches = greedy_step(active, cur, variant_type, max_weak)
-        nxt = []
-        for i, a in enumerate(active):
-            if i in matches:
-                j, cont, fp = matches[i]
-                b = dict(a); b['last'] = cur[j]; b['proto'] = update_proto(a['proto'], cur[j])
-                b['age'] += 1; b['active_hits'] += 1; b['weak_gap'] = 0; b['max_size'] = max(b['max_size'], cur[j]['size'])
-                nxt.append(b)
-            elif variant_type in ('C', 'D') and a['weak_gap'] < max_weak:
-                b = dict(a); b['age'] += 1; b['weak_gap'] += 1
-                nxt.append(b)
-            elif variant_type == 'D':
-                b = dict(a); b['dormant_gap'] = 1
-                dormant.append(b)
+
+def bridge_candidates(previous: list[dict[str, Any]], current: list[dict[str, Any]], entry: float) -> list[dict[str, Any]]:
+    inverted: dict[tuple[int, int], list[int]] = defaultdict(list)
+    for index, community in enumerate(current):
+        for member in community["members"]:
+            inverted[(community["layer"], member)].append(index)
+    candidates: list[dict[str, Any]] = []
+    for previous_index, prior in enumerate(previous):
+        counts: dict[int, int] = defaultdict(int)
+        for member in prior["members"]:
+            for current_index in inverted.get((prior["layer"], member), ()):
+                counts[current_index] += 1
+        for current_index, intersection in counts.items():
+            opened = current[current_index]
+            score = intersection / min(len(prior["members"]), len(opened["members"]))
+            if score >= entry:
+                proto = {"layer": prior["layer"], "members": prior["members"], "core": prior["core"], "mean_size": prior["size"]}
+                candidates.append(
+                    {
+                        "previous_index": previous_index,
+                        "current_index": current_index,
+                        "containment": score,
+                        "fingerprint": fingerprint(proto, opened),
+                        "layer": prior["layer"],
+                    }
+                )
+    candidates.sort(key=lambda item: (-item["containment"], -item["fingerprint"], item["previous_index"], item["current_index"]))
+    used_previous: set[int] = set()
+    used_current: set[int] = set()
+    selected: list[dict[str, Any]] = []
+    for candidate in candidates:
+        if candidate["previous_index"] in used_previous or candidate["current_index"] in used_current:
+            continue
+        used_previous.add(candidate["previous_index"])
+        used_current.add(candidate["current_index"])
+        selected.append(candidate)
+    return selected
+
+
+def match_active(active: list[dict[str, Any]], current: list[dict[str, Any]], arm: dict[str, Any]) -> dict[int, tuple[int, float, float]]:
+    candidates: list[tuple[float, int, int, float, float]] = []
+    for active_index, path in enumerate(active):
+        for current_index, community in enumerate(current):
+            if path["last"]["layer"] != community["layer"]:
+                continue
+            overlap = containment(path["last"]["members"], community["members"])
+            fp_score = fingerprint(path["proto"], community)
+            accepted = overlap >= float(arm.get("stay_containment", 0.20))
+            assisted_overlap = arm.get("assisted_stay_containment")
+            assisted_fp = arm.get("assisted_stay_fingerprint")
+            if assisted_overlap is not None and assisted_fp is not None:
+                accepted = accepted or (overlap >= float(assisted_overlap) and fp_score >= float(assisted_fp))
+            if accepted:
+                candidates.append((0.65 * overlap + 0.35 * fp_score, active_index, current_index, overlap, fp_score))
+    candidates.sort(reverse=True)
+    used_active: set[int] = set()
+    used_current: set[int] = set()
+    result: dict[int, tuple[int, float, float]] = {}
+    for _, active_index, current_index, overlap, fp_score in candidates:
+        if active_index in used_active or current_index in used_current:
+            continue
+        used_active.add(active_index)
+        used_current.add(current_index)
+        result[active_index] = (current_index, overlap, fp_score)
+    return result
+
+
+def follow_paths(
+    previous_roots: list[dict[str, Any]],
+    open_roots: list[dict[str, Any]],
+    future_states: list[list[dict[str, Any]]],
+    arm_name: str,
+    arm: dict[str, Any],
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    active: list[dict[str, Any]] = []
+    completed: list[dict[str, Any]] = []
+    dormant: list[dict[str, Any]] = []
+    state_rows: list[dict[str, Any]] = []
+    revival_rows: list[dict[str, Any]] = []
+    max_weak = int(arm.get("max_weak_gap", 0))
+    revival_enabled = bool(arm.get("revival", False))
+    max_dormant = int(arm.get("max_dormant_states", 0))
+    max_revivals = int(arm.get("max_revivals", 0))
+    pre_active = int(arm.get("pre_revival_active_states", 0))
+    revival_fp = float(arm.get("revival_fingerprint", 1.0))
+    breadth = arm.get("breadth_expansion")
+    post_confirm = int(arm.get("post_revival_confirmation_states", 0))
+
+    for path_index, (prior, opened) in enumerate(zip(previous_roots, open_roots)):
+        path = {
+            "path_id": f"{arm_name}:{prior['id']}->{opened['id']}",
+            "last": opened,
+            "proto": init_proto(prior, opened),
+            "age": 1,
+            "active_hits": 1,
+            "weak_gap": 0,
+            "dormant_gap": 0,
+            "revivals": 0,
+            "post_revival_hits": 0,
+        }
+        active.append(path)
+        state_rows.append({"path_id": path["path_id"], "time": opened["time"], "status": "active", "layer": opened["layer"], "size": opened["size"]})
+
+    for state_index, current in enumerate(future_states, start=1):
+        matches = match_active(active, current, arm)
+        next_active: list[dict[str, Any]] = []
+        used_current: set[int] = set()
+        for active_index, path in enumerate(active):
+            if active_index in matches:
+                current_index, overlap, fp_score = matches[active_index]
+                used_current.add(current_index)
+                community = current[current_index]
+                updated = dict(path)
+                updated["last"] = community
+                updated["proto"] = update_proto(path["proto"], community)
+                updated["age"] += 1
+                updated["active_hits"] += 1
+                updated["weak_gap"] = 0
+                if updated["revivals"]:
+                    updated["post_revival_hits"] += 1
+                next_active.append(updated)
+                state_rows.append({"path_id": updated["path_id"], "time": community["time"], "status": "active", "layer": community["layer"], "size": community["size"], "containment": overlap, "fingerprint": fp_score})
+            elif path["weak_gap"] < max_weak:
+                updated = dict(path)
+                updated["age"] += 1
+                updated["weak_gap"] += 1
+                next_active.append(updated)
+                state_rows.append({"path_id": updated["path_id"], "time": current[0]["time"] if current else None, "status": "weak", "layer": updated["last"]["layer"], "size": updated["last"]["size"]})
+            elif revival_enabled and path["active_hits"] >= pre_active and path["revivals"] < max_revivals:
+                updated = dict(path)
+                updated["dormant_gap"] = 1
+                dormant.append(updated)
             else:
-                done.append(a)
-        active = nxt
-        if variant_type == 'D' and dormant:
-            candidates = []
-            for i, a in enumerate(dormant):
-                for j, c in enumerate(cur):
-                    fp = fp_sim(a['proto'], c)
-                    if fp >= FP_REVIVE: candidates.append((fp, i, j))
-            candidates.sort(reverse=True); ud = set(); uc = set(); revived = []
-            for fp, i, j in candidates:
-                if i in ud or j in uc: continue
-                ud.add(i); uc.add(j)
-                a = dormant[i]; b = dict(a); b['last'] = cur[j]; b['proto'] = update_proto(a['proto'], cur[j])
-                b['age'] += a['dormant_gap'] + 1; b['active_hits'] += 1; b['weak_gap'] = 0; b['dormant_gap'] = 0; b['revivals'] += 1
-                b['max_size'] = max(b['max_size'], cur[j]['size'])
-                revived.append(b)
-            keep = []
-            for i, a in enumerate(dormant):
-                if i in ud: continue
-                b = dict(a); b['dormant_gap'] += 1
-                if b['dormant_gap'] > max_dormant: done.append(b)
-                else: keep.append(b)
-            dormant = keep
-            active.extend(revived)
-    return done + active + dormant
+                completed.append(path)
+        active = next_active
 
-def matched_controls(open_rows, used, roots):
-    pool = [(j, r) for j, r in enumerate(open_rows) if j not in used]
-    controls = []; taken = set()
+        if revival_enabled and dormant:
+            revival_candidates: list[tuple[float, int, int]] = []
+            for dormant_index, path in enumerate(dormant):
+                for current_index, community in enumerate(current):
+                    if current_index in used_current or path["last"]["layer"] != community["layer"]:
+                        continue
+                    fp_score = fingerprint(path["proto"], community)
+                    breadth_ok = breadth is None or community["size"] >= path["proto"]["mean_size"] * (1.0 + float(breadth))
+                    if fp_score >= revival_fp and breadth_ok:
+                        revival_candidates.append((fp_score, dormant_index, current_index))
+            revival_candidates.sort(reverse=True)
+            used_dormant: set[int] = set()
+            for fp_score, dormant_index, current_index in revival_candidates:
+                if dormant_index in used_dormant or current_index in used_current:
+                    continue
+                used_dormant.add(dormant_index)
+                used_current.add(current_index)
+                path = dormant[dormant_index]
+                community = current[current_index]
+                updated = dict(path)
+                updated["last"] = community
+                updated["proto"] = update_proto(path["proto"], community)
+                updated["age"] += updated["dormant_gap"] + 1
+                updated["active_hits"] += 1
+                updated["revivals"] += 1
+                updated["post_revival_hits"] = 1
+                updated["dormant_gap"] = 0
+                active.append(updated)
+                revival_rows.append({
+                    "path_id": updated["path_id"],
+                    "time": community["time"],
+                    "layer": community["layer"],
+                    "fingerprint": fp_score,
+                    "size": community["size"],
+                    "prototype_size": path["proto"]["mean_size"],
+                    "breadth_expansion": community["size"] / max(1.0, path["proto"]["mean_size"]) - 1.0,
+                    "dormant_gap": path["dormant_gap"],
+                })
+            retained: list[dict[str, Any]] = []
+            for dormant_index, path in enumerate(dormant):
+                if dormant_index in used_dormant:
+                    continue
+                updated = dict(path)
+                updated["dormant_gap"] += 1
+                if updated["dormant_gap"] > max_dormant:
+                    completed.append(updated)
+                else:
+                    retained.append(updated)
+            dormant = retained
+
+    final_paths = completed + active + dormant
+    outcome_rows = []
+    for path in final_paths:
+        confirmed_revival = bool(path["revivals"] and path["post_revival_hits"] >= max(1, post_confirm))
+        outcome_rows.append({
+            "path_id": path["path_id"],
+            "layer": path["last"]["layer"],
+            "age_states": path["age"],
+            "active_hits": path["active_hits"],
+            "revivals": path["revivals"],
+            "post_revival_hits": path["post_revival_hits"],
+            "confirmed_revival": confirmed_revival,
+            "persistent_3": path["active_hits"] >= 3,
+            "persistent_5": path["active_hits"] >= 5,
+            "persistent_10": path["active_hits"] >= 10,
+            "persistent_20": path["active_hits"] >= 20,
+        })
+    return pd.DataFrame(state_rows), pd.DataFrame(revival_rows), pd.DataFrame(outcome_rows)
+
+
+def matched_controls(open_rows: list[dict[str, Any]], used: set[int], roots: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    pool = [(index, row) for index, row in enumerate(open_rows) if index not in used]
+    selected: list[dict[str, Any]] = []
+    taken: set[int] = set()
     for root in roots:
-        opts = [(abs(math.log(max(1, r['size'])) - math.log(max(1, root['size']))), j, r) for j, r in pool if j not in taken and r['layer'] == root['layer']]
-        if not opts: opts = [(abs(math.log(max(1, r['size'])) - math.log(max(1, root['size']))), j, r) for j, r in pool if j not in taken]
-        if opts:
-            _, j, r = min(opts); taken.add(j); controls.append(r)
-    return controls
+        options = [
+            (abs(math.log(max(1, row["size"])) - math.log(max(1, root["size"]))), index, row)
+            for index, row in pool
+            if index not in taken and row["layer"] == root["layer"]
+        ]
+        if options:
+            _, index, row = min(options)
+            taken.add(index)
+            selected.append(row)
+    return selected
 
-def atomic_write(df: pd.DataFrame, path: Path):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix('.tmp')
-    df.to_parquet(tmp)
-    tmp.replace(path)
 
-def main():
+def evaluate_unit(
+    close_state: list[dict[str, Any]],
+    open_states: list[list[dict[str, Any]]],
+    arm_name: str,
+    arm: dict[str, Any],
+    unit_dir: Path,
+    control_name: str,
+    replicate: int,
+) -> None:
+    entry = float(arm.get("entry_containment", 0.18))
+    candidates = bridge_candidates(close_state, open_states[0], entry)
+    fingerprint_confirm = arm.get("fingerprint_confirm")
+    chosen = [candidate for candidate in candidates if fingerprint_confirm is None or candidate["fingerprint"] >= float(fingerprint_confirm)]
+    previous_roots = [close_state[item["previous_index"]] for item in chosen]
+    open_roots = [open_states[0][item["current_index"]] for item in chosen]
+    used = {item["current_index"] for item in chosen}
+    controls = matched_controls(open_states[0], used, open_roots)
+
+    path_states, revival_events, outcomes = follow_paths(previous_roots, open_roots, open_states[1:], arm_name, arm)
+    control_states, control_revivals, control_outcomes = follow_paths(controls, controls, open_states[1:], arm_name, arm)
+    for frame, kind in ((outcomes, "bridge"), (control_outcomes, "open_birth_control")):
+        if not frame.empty:
+            frame["kind"] = kind
+            frame["control"] = control_name
+            frame["replicate"] = replicate
+    combined_outcomes = pd.concat([outcomes, control_outcomes], ignore_index=True) if not outcomes.empty or not control_outcomes.empty else pd.DataFrame()
+
+    bridge_frame = pd.DataFrame(chosen)
+    if not bridge_frame.empty:
+        bridge_frame["arm"] = arm_name
+        bridge_frame["control"] = control_name
+        bridge_frame["replicate"] = replicate
+    atomic_write(bridge_frame, unit_dir / "bridge_candidates.parquet")
+    atomic_write(pd.concat([path_states, control_states], ignore_index=True), unit_dir / "path_states.parquet")
+    atomic_write(pd.concat([revival_events, control_revivals], ignore_index=True), unit_dir / "revival_events.parquet")
+    atomic_write(pd.DataFrame([{"matched_controls": len(controls)}]), unit_dir / "matched_controls.parquet")
+    atomic_write(combined_outcomes, unit_dir / "outcomes.parquet")
+    manifest = {
+        "arm": arm_name,
+        "control": control_name,
+        "replicate": replicate,
+        "bridge_count": len(chosen),
+        "control_count": len(controls),
+    }
+    (unit_dir / "task_manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    (unit_dir / "_SUCCESS").write_text("success\n", encoding="utf-8")
+
+
+def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument('--config', required=True)
-    parser.add_argument('--date-from', required=True)
-    parser.add_argument('--date-to', required=True)
-    parser.add_argument('--seed', type=int, required=True)
-    parser.add_argument('--output-dir', required=True)
-    parser.add_argument("--control-index", type=int, default=1)
-    parser.add_argument("--phase1-root", type=str, default="outputs/theme_discovery_phase1")
+    parser.add_argument("--config", required=True)
+    parser.add_argument("--date-from", required=True)
+    parser.add_argument("--date-to", required=True)
+    parser.add_argument("--seed", type=int, required=True)
+    parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--phase1-root", default="outputs/theme_discovery_phase1")
     args = parser.parse_args()
 
-    config = json.loads(Path(args.config).read_text(encoding='utf-8'))
-    input_root = Path(args.phase1_root)
+    config = json.loads(Path(args.config).read_text(encoding="utf-8"))
+    phase1_root = Path(args.phase1_root)
     output_root = Path(args.output_dir)
-    output_root.mkdir(parents=True, exist_ok=True)
+    min_size = int(config.get("min_community_size", 20))
+    horizon = int(config.get("open_horizon_states", 30))
 
-    print(f"[{args.date_from} -> {args.date_to}] Loading boundary data...", flush=True)
+    close_frame, close_times = load_day(phase1_root, args.date_from, min_size)
+    open_frame, open_times = load_day(phase1_root, args.date_to, min_size)
+    close_state = state_at(close_frame, close_times[-1])
+    actual_states = [state_at(open_frame, timestamp) for timestamp in open_times[:horizon]]
+    if not actual_states:
+        raise RuntimeError(f"No open states for {args.date_to}")
 
-    # 1. Load Close State
-    df_close = pq.read_table(input_root / f"date={args.date_from}" / "themes.parquet").to_pandas()
-    times_close = sorted(df_close['snapshot_time'].unique())
-    close_state = load_state_from_df(df_close, times_close[-1])
+    arms = config.get("arms", {})
+    if not isinstance(arms, dict) or not arms:
+        raise ValueError("config.arms must be a non-empty mapping")
 
-    # 2. Load Actual Open State
-    df_open = pq.read_table(input_root / f"date={args.date_to}" / "themes.parquet").to_pandas()
-    times_open = sorted(df_open['snapshot_time'].unique())[:H]
-    actual_opens = [load_state_from_df(df_open, t) for t in times_open]
+    null_mapping_path = output_root / "null_mapping.parquet"
+    null_rows = pd.read_parquet(null_mapping_path) if null_mapping_path.exists() else pd.DataFrame()
+    boundary_nulls = null_rows[
+        (null_rows["actual_date_from"] == args.date_from)
+        & (null_rows["actual_date_to"] == args.date_to)
+    ] if not null_rows.empty else pd.DataFrame()
+    null_cache: dict[str, list[list[dict[str, Any]]]] = {}
 
-    # Shared indices
-    actual_bc = bridge_candidates(close_state, actual_opens[0])
+    expected_units: list[Path] = []
+    for arm_name, raw_arm in arms.items():
+        arm = dict(raw_arm)
+        if "inherit" in arm:
+            parent = dict(arms[arm["inherit"]])
+            parent.update({key: value for key, value in arm.items() if key != "inherit"})
+            arm = parent
 
-    # Prepare Null mapping lookup
-    null_mapping_path = Path(config["output_root"]) / config["run_name"] / "null_mapping.parquet"
-    nulls = []
-    if null_mapping_path.exists():
-        nm = pq.read_table(null_mapping_path).to_pandas()
-        nulls = nm[(nm['actual_date_from'] == args.date_from) & (nm['actual_date_to'] == args.date_to)].to_dict('records')
+        actual_dir = output_root / "shards" / f"date_from={args.date_from}" / f"date_to={args.date_to}" / f"arm={arm_name}" / "control=actual" / "replicate=0"
+        expected_units.append(actual_dir)
+        if not (actual_dir / "_SUCCESS").exists():
+            evaluate_unit(close_state, actual_states, arm_name, arm, actual_dir, "actual", 0)
 
-    # Load Null Open States
-    null_opens_cache = {}
-    for n in nulls:
-        nd = n['null_date_to']
-        if nd not in null_opens_cache:
-            try:
-                nd_df = pq.read_table(input_root / f"date={nd}" / "themes.parquet").to_pandas()
-                nd_times = sorted(nd_df['snapshot_time'].unique())[:H]
-                null_opens_cache[nd] = [load_state_from_df(nd_df, t) for t in nd_times]
-            except Exception as e:
-                print(f"Warning: could not load null {nd}: {e}")
-                null_opens_cache[nd] = None
+        for _, null_row in boundary_nulls.iterrows():
+            null_date = str(null_row["null_date_to"])
+            replicate = int(null_row["replicate"])
+            if null_date not in null_cache:
+                null_frame, null_times = load_day(phase1_root, null_date, min_size)
+                null_cache[null_date] = [state_at(null_frame, timestamp) for timestamp in null_times[:horizon]]
+            unit_dir = output_root / "shards" / f"date_from={args.date_from}" / f"date_to={args.date_to}" / f"arm={arm_name}" / "control=day_order" / f"replicate={replicate}"
+            expected_units.append(unit_dir)
+            if not (unit_dir / "_SUCCESS").exists():
+                evaluate_unit(close_state, null_cache[null_date], arm_name, arm, unit_dir, "day_order", replicate)
 
-    arms = config.get("arms", ["A","B","C","D15"])
+    missing = [str(path) for path in expected_units if not (path / "_SUCCESS").exists()]
+    if missing:
+        raise RuntimeError(f"Boundary incomplete; missing units: {missing[:10]}")
+    print(f"[{args.date_from} -> {args.date_to}] completed {len(expected_units)} units", flush=True)
 
-    for arm in arms:
-        if arm.startswith("D"):
-            variant_type = "D"
-            max_dormant = int(arm[1:])
-        else:
-            variant_type = arm
-            max_dormant = 0
 
-        # Evaluate Actual
-        unit_dir = output_root / "shards" / f"date_from={args.date_from}" / f"date_to={args.date_to}" / f"arm={arm}" / "control=actual" / "replicate=0"
-        if not (unit_dir / "_SUCCESS").exists():
-            print(f"[{args.date_from} -> {args.date_to}] Evaluating Arm {arm} Control actual", flush=True)
-            chosen = []
-            for i, j, s, fp in actual_bc:
-                if variant_type == 'A' and s >= .20: chosen.append((i, j, s, fp))
-                elif variant_type in ('B', 'C', 'D') and fp >= FP_CONFIRM: chosen.append((i, j, s, fp))
-            prevroots = [close_state[i] for i, j, s, fp in chosen]
-            roots = [actual_opens[0][j] for i, j, s, fp in chosen]
-            used = {j for i, j, s, fp in chosen}
-            
-            c_roots = matched_controls(actual_opens[0], used, roots)
-            paths = follow(prevroots, roots, actual_opens[1:], variant_type, 1, max_dormant)
-            c_paths = follow(c_roots, c_roots, actual_opens[1:], variant_type, 1, max_dormant)
-
-            atomic_write(pd.DataFrame({'n': [len(paths)]}), unit_dir / "outcomes.parquet")
-            atomic_write(pd.DataFrame({'n': [len(c_paths)]}), unit_dir / "matched_controls.parquet")
-            atomic_write(pd.DataFrame(), unit_dir / "bridge_candidates.parquet")
-            atomic_write(pd.DataFrame(), unit_dir / "path_states.parquet")
-            atomic_write(pd.DataFrame(), unit_dir / "revival_events.parquet")
-            (unit_dir / "_SUCCESS").write_text("success\n", encoding="utf-8")
-
-        # Evaluate Nulls
-        for n in nulls:
-            nd = n['null_date_to']
-            rep = n['replicate']
-            unit_dir = output_root / "shards" / f"date_from={args.date_from}" / f"date_to={args.date_to}" / f"arm={arm}" / "control=day_order" / f"replicate={rep}"
-            if (unit_dir / "_SUCCESS").exists(): continue
-            
-            null_ops = null_opens_cache.get(nd)
-            if not null_ops: continue
-            
-            print(f"[{args.date_from} -> {args.date_to}] Evaluating Arm {arm} Control day_order rep {rep}", flush=True)
-            bc = bridge_candidates(close_state, null_ops[0])
-            chosen = []
-            for i, j, s, fp in bc:
-                if variant_type == 'A' and s >= .20: chosen.append((i, j, s, fp))
-                elif variant_type in ('B', 'C', 'D') and fp >= FP_CONFIRM: chosen.append((i, j, s, fp))
-            prevroots = [close_state[i] for i, j, s, fp in chosen]
-            roots = [null_ops[0][j] for i, j, s, fp in chosen]
-            used = {j for i, j, s, fp in chosen}
-            
-            c_roots = matched_controls(null_ops[0], used, roots)
-            paths = follow(prevroots, roots, null_ops[1:], variant_type, 1, max_dormant)
-            c_paths = follow(c_roots, c_roots, null_ops[1:], variant_type, 1, max_dormant)
-
-            atomic_write(pd.DataFrame({'n': [len(paths)]}), unit_dir / "outcomes.parquet")
-            atomic_write(pd.DataFrame({'n': [len(c_paths)]}), unit_dir / "matched_controls.parquet")
-            atomic_write(pd.DataFrame(), unit_dir / "bridge_candidates.parquet")
-            atomic_write(pd.DataFrame(), unit_dir / "path_states.parquet")
-            atomic_write(pd.DataFrame(), unit_dir / "revival_events.parquet")
-            (unit_dir / "_SUCCESS").write_text("success\n", encoding="utf-8")
-
-    print(f"[{args.date_from} -> {args.date_to}] Boundary Complete.", flush=True)
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
