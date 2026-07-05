@@ -245,20 +245,32 @@ def main():
     config = BuildConfig.from_yaml(args.config) if args.config else BuildConfig()
     CanonicalGraphStore(output_root, config).finalize_catalog()
 
-    # 4. Run Theme Discovery Phase
-    theme_config = ThemeDiscoveryConfig(run_id=f"run_{args.target_month}", frame_minutes=5)
-    theme_pipeline = ThemeDiscoveryPipeline(output_root, output_root / "themes", theme_config)
-    logger.info("Starting Two-Pass Theme Discovery Pipeline...")
+    # 4. Run Theme Discovery Phase 1
+    logger.info("Starting Theme Discovery Phase 1...")
     theme_start_time = time.time()
-    # Use max_workers to saturate the machine
-    if args.target_date:
-        theme_results = theme_pipeline.run(date_start=args.target_date, date_end=args.target_date, max_workers=args.max_workers)
-    else:
-        theme_results = theme_pipeline.run(date_start=f"{args.target_month}-01", date_end=f"{args.target_month}-31", max_workers=args.max_workers)
-    theme_elapsed = time.time() - theme_start_time
-    logger.info(f"Theme Pipeline complete in {theme_elapsed:.2f}s.")
+    
+    # We call scripts/run_theme_discovery_phase1.py for the target month
+    # We can pass date_start and date_end corresponding to the month
+    import calendar
+    year, month = map(int, args.target_month.split("-"))
+    last_day = calendar.monthrange(year, month)[1]
+    date_start = f"{args.target_month}-01"
+    date_end = f"{args.target_month}-{last_day:02d}"
+    
+    cmd = [
+        sys.executable, "scripts/run_theme_discovery_phase1.py",
+        "--date-start", date_start,
+        "--date-end", date_end,
+        "--max-snapshot-workers", str(args.workers),
+        "--graph-root", str(args.graph_store),
+        "--out-root", str(output_root / "themes")
+    ]
+    subprocess.run(cmd, check=True)
 
-    update_dashboard(output_root, args.target_month, graph_results, theme_results)
+    theme_elapsed = time.time() - theme_start_time
+    logger.info(f"Theme Discovery Phase 1 complete in {theme_elapsed:.2f}s.")
+
+
     
     logger.info(f"Phase 0 completely finished for {args.target_month}.")
 
