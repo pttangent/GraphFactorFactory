@@ -47,7 +47,11 @@ def main() -> None:
         thresholds=thresholds,
         community_resolution=args.community_resolution,
     )
-    temporal = compute_temporal_diagnostics(edges, thresholds)
+    temporal_parts = [
+        compute_temporal_diagnostics(day_edges, thresholds)
+        for _, day_edges in edges.groupby("trade_date", sort=True)
+    ]
+    temporal = pd.concat(temporal_parts, ignore_index=True) if temporal_parts else pd.DataFrame()
     resonance = compute_resonance_diagnostics(edges, layers)
     daily = aggregate_daily_market_diagnostics(snapshot, temporal, resonance)
 
