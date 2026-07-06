@@ -106,7 +106,11 @@ def _atomic_merge_parquet(
     unique_keys: list[str],
 ) -> dict[str, int]:
     baseline = pq.read_table(baseline_path)
+    if "date" in baseline.column_names:
+        baseline = baseline.drop(["date"])
     patch = pq.read_table(patch_path)
+    if "date" in patch.column_names:
+        patch = patch.drop(["date"])
     preserved = _table_without_layers(baseline, layer_ids)
     patch_ids = set(pc.unique(patch["layer_id"]).to_pylist()) if patch.num_rows else set()
     missing = set(layer_ids) - patch_ids
@@ -239,13 +243,15 @@ class ReturnCorrPatchPipeline:
         if events.empty:
             raise ValueError(f"No regular-session rows for {trade_date}")
         audit_source_events(events)
-        events = events[events["symbol"].astype(str).isin(symbols["symbol"].astype(str))].copy()
+        keep_symbols = set(symbols["symbol"].astype(str)) | set(self.config.return_corr_benchmarks)
+        events = events[events["symbol"].astype(str).isin(keep_symbols)].copy()
         events["timestamp"] = pd.to_datetime(events["timestamp"], utc=True)
         events["available_time"] = pd.to_datetime(events["available_time"], utc=True)
 
         coverage = _benchmark_coverage(events, trade_date, self.config)
         if bool(coverage["fallback_used"].all()):
-            raise ValueError(f"All configured ReturnCorr benchmarks are unavailable on {trade_date}")
+            import logging
+            logging.warning(f"All configured ReturnCorr benchmarks are unavailable on {trade_date}. Falling back to cross-sectional median residualization.")
 
         graph_decisions = decision_grid(events, self.config)
         graph_decisions = graph_decisions[:: max(1, self.config.graph_step_minutes // 5)]
