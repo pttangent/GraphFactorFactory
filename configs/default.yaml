@@ -14,3 +14,6 @@ store_qlib_cache: false
 split_csv_path: data/splits.csv
 parquet_compression: zstd
 parquet_compression_level: 6
+return_corr_benchmarks: [SPY, QQQ, IWM]
+return_corr_min_benchmark_points: 8
+return_corr_ridge: 1.0e-6
