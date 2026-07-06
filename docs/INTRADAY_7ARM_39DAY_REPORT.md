@@ -1,5 +1,7 @@
 # Intraday 7-arm 39-day Layer Analysis
 
+> Status: this report is the **pre-residual ReturnCorr baseline**. It was generated from the original 13-layer Phase 1 outputs. After rebuilding Phase 0 layers 1/14/15 and rerunning full Phase 1, regenerate every table in this report. Do not use the current ReturnCorr row as the final layer recommendation.
+
 ## Scope
 - Period: 2026-01-02 to 2026-02-27, 39 trading days
 - Input: Phase 1 `layer_communities.parquet`
@@ -42,13 +44,16 @@ The current composite ranking selects D9 for 12 of 13 layers; `off_exchange` is 
 2. D arms have a mechanical advantage because they permit dormant gaps and revival.
 3. There is no matched open-birth/null control in this run.
 4. There is no penalty yet for identity drift, split/merge, or false revival.
-5. `return_corr` is still raw and has not been residualized against SPY/QQQ/IWM.
+5. `return_corr` in this report is raw and predates the SPY/QQQ/IWM residual layers.
 6. Sampling every fifth minute is a computational approximation; a final production run should repeat at 1-minute resolution for shortlisted arms.
+7. Phase 0 now registers `return_corr_market_residual` and `return_corr_cross_sectional_residual`; these are absent from the current report and must be added after Phase 1 rebuild.
 
 ## Next required work
-1. Add matched controls per day/layer/arm using size, density, liquidity, and birth-time matching.
-2. Add path identity metrics: core retention, member turnover, split/merge, fingerprint drift.
-3. Add false-revival definition: revival followed by death within 2-3 states or severe fingerprint decay.
-4. Rebuild `return_corr_market_residual` using SPY/QQQ/IWM residual returns; compare sector/industry purity against raw ReturnCorr.
-5. Add network metrics from Phase 0 edges: density, clustering, assortativity, giant-component share, conductance, degree distribution, and proper power-law model comparison.
-6. Run forward returns at 5/15/30/60m, close, and T+1 for each path and arm.
+1. Rebuild Phase 0 ReturnCorr layers 1/14/15 for all 39 dates, preferably with the atomic patch path when its smoke test passes.
+2. Rerun full Phase 1 because consensus now uses the market-residual price layer and excludes raw/cross-sectional price votes.
+3. Regenerate this report with raw, market-residual, and cross-sectional-residual ReturnCorr shown separately.
+4. Add matched controls per day/layer/arm using size, density, liquidity, and birth-time matching.
+5. Add path identity metrics: core retention, member turnover, split/merge, fingerprint drift.
+6. Add false-revival definition: revival followed by death within 2-3 states or severe fingerprint decay.
+7. Add network metrics from Phase 0 edges: density, clustering, assortativity, giant-component share, conductance, degree distribution, and proper power-law model comparison.
+8. Run forward returns at 5/15/30/60m, close, and T+1 for each path and arm.
