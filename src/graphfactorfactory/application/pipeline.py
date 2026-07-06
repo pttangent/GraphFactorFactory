@@ -14,11 +14,12 @@ from graphfactorfactory.infrastructure.corporate_actions import SplitAdjustmentS
 from graphfactorfactory.infrastructure.store import CanonicalGraphStore
 from graphfactorfactory.ports.node_source import NodeFactorSource
 
+
 def _process_chunk(args):
-    chunk_decisions, chunk_data, config, symbols = args
+    chunk_decisions, chunk_data, config, symbols, layers, include_multiplex = args
     from graphfactorfactory.application.graph import MultilayerGraphBuilder
-    builder = MultilayerGraphBuilder(config, symbols)
-    
+    builder = MultilayerGraphBuilder(config, symbols, layers=tuple(layers), include_multiplex=include_multiplex)
+
     results = []
     for t in chunk_decisions:
         decision_time = pd.Timestamp(t)
@@ -60,44 +61,36 @@ class GraphFactorPipeline:
                 labels["symbol_id"] = labels["symbol"].map(symbol_lookup).astype("int32")
                 writer.write_labels(labels.drop(columns="symbol"))
                 label_rows = len(labels)
-            builder = MultilayerGraphBuilder(self.config, symbols)
             graph_decisions = decision_grid(events, self.config)
             graph_decisions = graph_decisions[:: max(1, self.config.graph_step_minutes // 5)]
-            
-            # Pre-process data for filtering
+
             symbols_list = symbols.sort_values("symbol_id")["symbol"].astype(str).tolist()
             data = events[events["symbol"].isin(symbols_list)].copy()
             data["timestamp"] = pd.to_datetime(data["timestamp"], utc=True)
             data["available_time"] = pd.to_datetime(data["available_time"], utc=True)
-            
+
             from concurrent.futures import ProcessPoolExecutor, as_completed
             import numpy as np
-            # Use max_threads passed in or default to 26
             max_threads = getattr(self, "max_threads", 26)
-            
-            # Chunk the decisions to avoid Windows IPC memory duplication
             chunks = np.array_split(graph_decisions, max_threads)
-            
+
             chunk_tasks = []
             for chunk in chunks:
-                if len(chunk) == 0: continue
-                # Get the min and max decision time for this chunk to slice data
+                if len(chunk) == 0:
+                    continue
                 min_t = pd.Timestamp(chunk[0])
                 min_t = min_t.tz_localize("UTC") if min_t.tzinfo is None else min_t.tz_convert("UTC")
                 max_t = pd.Timestamp(chunk[-1])
                 max_t = max_t.tz_localize("UTC") if max_t.tzinfo is None else max_t.tz_convert("UTC")
-                
                 chunk_window_start = min_t - pd.Timedelta(minutes=self.config.graph_window_minutes)
-                
-                # Slice data specifically for this chunk to save memory over IPC
                 chunk_data = data[(data["timestamp"] > chunk_window_start) & (data["available_time"] <= max_t)].copy()
-                chunk_tasks.append((list(chunk), chunk_data, self.config, symbols))
-            
+                chunk_tasks.append((list(chunk), chunk_data, self.config, symbols, LAYERS, True))
+
             if executor:
                 futures = {executor.submit(_process_chunk, task): task[0] for task in chunk_tasks}
                 for future in as_completed(futures):
                     chunk_results = future.result()
-                    for products, t in chunk_results:
+                    for products, _ in chunk_results:
                         writer.write_edges(products.edges)
                         writer.write_node_features(products.node_features)
                         writer.write_snapshots(products.snapshots)
@@ -106,11 +99,11 @@ class GraphFactorPipeline:
                     futures = {pool.submit(_process_chunk, task): task[0] for task in chunk_tasks}
                     for future in as_completed(futures):
                         chunk_results = future.result()
-                        for products, t in chunk_results:
+                        for products, _ in chunk_results:
                             writer.write_edges(products.edges)
                             writer.write_node_features(products.node_features)
                             writer.write_snapshots(products.snapshots)
-                    
+
         catalog = self.store.finalize_catalog()
         manifest = self.store.write_manifest(trade_date=trade_date, source_fingerprint=self.source.fingerprint(), config=self.config, universe_count=len(universe), node_feature_columns=self.source.numeric_feature_columns(), split_source_metadata=split_source.metadata if split_source else None)
         counts = self.store.count_date_rows(trade_date)
