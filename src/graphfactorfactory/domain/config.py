@@ -29,6 +29,7 @@ class GraphParameters:
 
 @dataclass(frozen=True)
 class BuildConfig:
+    parameter_set_id: str = "default"
     frequency: str = "1min"
     market_timezone: str = "America/New_York"
     market_open: str = "09:30"
@@ -85,12 +86,7 @@ class BuildConfig:
         )
 
     def graph_parameters_for(self, *, layer_name: str, family: str, lookback_minutes: int) -> GraphParameters:
-        """Resolve graph parameters from broad to specific.
-
-        Supported override keys, in precedence order:
-        ``family:<family>``, ``layer:<layer_name>``, and
-        ``scale:<layer_name>:<lookback_minutes>``.
-        """
+        """Resolve global, family, layer and layer-scale graph parameters."""
         values = asdict(self.base_graph_parameters)
         keys = (
             f"family:{family}",
@@ -110,7 +106,6 @@ class BuildConfig:
         ).validate()
 
     def with_graph_parameters(self, parameters: GraphParameters) -> "BuildConfig":
-        """Return a lightweight config view accepted by graph constructors."""
         parameters.validate()
         return replace(
             self,
