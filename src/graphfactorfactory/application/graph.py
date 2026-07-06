@@ -37,7 +37,15 @@ class MultilayerGraphBuilder:
         signed_flow = zscore(current[flow_column].to_numpy(dtype=np.float32))
         edge_records, node_records, snapshot_records, adjacencies = [], [], [], []
         for layer in LAYERS:
-            vectors, window_points, used_columns = trajectory(window, layer, self.symbols, self.config.minimum_window_points)
+            vectors, window_points, used_columns = trajectory(
+                window,
+                layer,
+                self.symbols,
+                self.config.minimum_window_points,
+                return_corr_benchmarks=self.config.return_corr_benchmarks,
+                return_corr_min_benchmark_points=self.config.return_corr_min_benchmark_points,
+                return_corr_ridge=self.config.return_corr_ridge,
+            )
             if vectors is None:
                 continue
             adjacency, kept_edges, lsh_bits = reciprocal_lsh_graph(vectors, self.config)
@@ -51,7 +59,7 @@ class MultilayerGraphBuilder:
                 edge_records.append({"decision_time": decision_time, "window_start": window_start, "window_end": decision_time, "layer_id": np.int16(layer.layer_id), "src_id": np.int32(self.symbol_ids[left]), "dst_id": np.int32(self.symbol_ids[right]), "weight": np.float32(weight), "src_rank": np.int16(left_rank), "dst_rank": np.int16(right_rank), "directed": layer.directed, "lag_bars": np.int16(layer.lag_bars), "window_points": np.int16(window_points), "vector_dimension": np.int16(vectors.shape[1])})
             for index, symbol_id in enumerate(self.symbol_ids):
                 node_records.append({"decision_time": decision_time, "layer_id": np.int16(layer.layer_id), "symbol_id": np.int32(symbol_id), "degree": degree[index], "strength": strength[index], "core_z": np.float32(core[index]), "neighbor_reversal": neighbor_reversal[index], "neighbor_signed_flow": neighbor_flow[index], "layer_participation": np.float32(degree[index] > 0)})
-            snapshot_records.append({"decision_time": decision_time, "window_start": window_start, "window_end": decision_time, "layer_id": np.int16(layer.layer_id), "universe_count": np.int32(len(self.symbols)), "active_nodes": np.int32((degree > 0).sum()), "edge_count": np.int32(len(kept_edges)), "mean_degree": np.float32(degree.mean()), "mean_strength": np.float32(strength.mean()), "window_points": np.int16(window_points), "vector_dimension": np.int16(vectors.shape[1]), "lsh_bits": np.int16(lsh_bits), "used_columns": ",".join(used_columns)})
+            snapshot_records.append({"decision_time": decision_time, "window_start": window_start, "window_end": decision_time, "layer_id": np.int16(layer.layer_id), "universe_count": np.int32(len(self.symbols)), "active_nodes": np.int32((degree > 0).sum()), "edge_count": np.int32(len(kept_edges)), "mean_degree": np.float32(degree.mean()), "mean_strength": np.float32(strength.mean()), "window_points": np.int16(window_points), "vector_dimension": np.int16(vectors.shape[1]), "lsh_bits": np.int16(lsh_bits), "used_columns": ",".join(used_columns), "transform": layer.transform})
         if adjacencies:
             multiplex = sum(adjacencies) / np.float32(len(adjacencies))
             degree = np.diff(multiplex.indptr).astype(np.int16)
