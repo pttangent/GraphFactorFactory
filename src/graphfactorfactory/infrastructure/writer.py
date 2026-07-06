@@ -11,6 +11,9 @@ from graphfactorfactory.infrastructure.schemas import EDGE_SCHEMA, NODE_SCHEMA, 
 
 
 def _arrow_table(frame: pd.DataFrame, schema: pa.Schema) -> pa.Table:
+    undeclared = sorted(set(frame.columns).difference(schema.names))
+    if undeclared:
+        raise ValueError(f"Parquet schema would discard undeclared columns: {undeclared}")
     if frame.empty:
         return pa.Table.from_pylist([], schema=schema)
     return pa.Table.from_pandas(frame, schema=schema, preserve_index=False, safe=False)

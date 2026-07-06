@@ -15,6 +15,12 @@ from graphfactorfactory.infrastructure.store import CanonicalGraphStore
 from graphfactorfactory.ports.node_source import NodeFactorSource
 
 
+def _partition_decisions(decisions, chunk_size: int) -> list[list]:
+    size = max(1, int(chunk_size))
+    values = list(decisions)
+    return [values[index : index + size] for index in range(0, len(values), size)]
+
+
 def _process_chunk(args):
     chunk_decisions, chunk_data, config, symbols, layers, include_multiplex = args
     from graphfactorfactory.application.graph import MultilayerGraphBuilder
@@ -84,10 +90,9 @@ class GraphFactorPipeline:
             data["available_time"] = pd.to_datetime(data["available_time"], utc=True)
 
             from concurrent.futures import ProcessPoolExecutor, as_completed
-            import numpy as np
-
             max_threads = getattr(self, "max_threads", 26)
-            chunks = np.array_split(graph_decisions, max_threads)
+            task_chunk_size = getattr(self, "task_chunk_size", 3)
+            chunks = _partition_decisions(graph_decisions, task_chunk_size)
             chunk_tasks = []
             for chunk in chunks:
                 if len(chunk) == 0:
@@ -100,21 +105,27 @@ class GraphFactorPipeline:
                 chunk_data = data[(data["timestamp"] > chunk_window_start) & (data["available_time"] <= max_t)].copy()
                 chunk_tasks.append((list(chunk), chunk_data, self.config, symbols, LAYERS, True))
 
-            if executor:
-                futures = {executor.submit(_process_chunk, task): task[0] for task in chunk_tasks}
+            def consume(pool):
+                futures = {
+                    pool.submit(_process_chunk, task): index
+                    for index, task in enumerate(chunk_tasks)
+                }
+                buffered = {}
+                next_index = 0
                 for future in as_completed(futures):
-                    for products, _ in future.result():
-                        writer.write_edges(products.edges)
-                        writer.write_node_features(products.node_features)
-                        writer.write_snapshots(products.snapshots)
-            else:
-                with ProcessPoolExecutor(max_workers=max_threads) as pool:
-                    futures = {pool.submit(_process_chunk, task): task[0] for task in chunk_tasks}
-                    for future in as_completed(futures):
-                        for products, _ in future.result():
+                    buffered[futures[future]] = future.result()
+                    while next_index in buffered:
+                        for products, _ in buffered.pop(next_index):
                             writer.write_edges(products.edges)
                             writer.write_node_features(products.node_features)
                             writer.write_snapshots(products.snapshots)
+                        next_index += 1
+
+            if executor:
+                consume(executor)
+            else:
+                with ProcessPoolExecutor(max_workers=max_threads) as pool:
+                    consume(pool)
 
         catalog = self.store.finalize_catalog()
         manifest = self.store.write_manifest(

@@ -23,7 +23,12 @@ def decision_grid(events: pd.DataFrame, config: BuildConfig) -> pd.DatetimeIndex
         return pd.DatetimeIndex([], tz="UTC")
     available = pd.to_datetime(events["available_time"], utc=True)
     start = available.min().ceil(config.frequency)
-    end = available.max().floor(config.frequency)
+    timestamps = pd.to_datetime(events["timestamp"], utc=True)
+    session_date = timestamps.dt.tz_convert(config.market_timezone).dt.date.min()
+    session_close = pd.Timestamp(
+        f"{session_date} {config.market_close}", tz=config.market_timezone
+    ).tz_convert("UTC")
+    end = min(available.max().floor(config.frequency), session_close)
     return pd.date_range(start, end, freq=config.frequency)
 
 
