@@ -106,14 +106,22 @@ class GraphFactorPipeline:
                 chunk_tasks.append((list(chunk), chunk_data, self.config, symbols, LAYERS, True))
 
             def consume(pool):
+                import logging
+                logger = logging.getLogger(__name__)
+                total_chunks = len(chunk_tasks)
+                logger.info(f"Phase 0: Submitted {total_chunks} chunk tasks for processing.")
                 futures = {
                     pool.submit(_process_chunk, task): index
                     for index, task in enumerate(chunk_tasks)
                 }
                 buffered = {}
                 next_index = 0
+                completed = 0
                 for future in as_completed(futures):
                     buffered[futures[future]] = future.result()
+                    completed += 1
+                    if completed % max(1, total_chunks // 10) == 0 or completed == total_chunks:
+                        logger.info(f"Phase 0 Progress: {completed}/{total_chunks} chunks completed ({(completed/total_chunks)*100:.1f}%)")
                     while next_index in buffered:
                         for products, _ in buffered.pop(next_index):
                             writer.write_edges(products.edges)
