@@ -29,6 +29,10 @@ RETURN_LAYER_IDS = (1, 14, 15)
 RETURN_LAYERS = tuple(layer for layer in LAYERS if layer.layer_id in RETURN_LAYER_IDS)
 
 
+def _sql_path(path: Path) -> str:
+    return str(path).replace("'", "''")
+
+
 def _layer_dimensions() -> pd.DataFrame:
     return pd.DataFrame(
         [
@@ -72,19 +76,48 @@ def _atomic_merge_table(target: Path, patch: Path, layer_ids: tuple[int, ...], c
     if not target.exists():
         raise FileNotFoundError(target)
     temporary = target.with_suffix(target.suffix + ".patching")
+    temporary.unlink(missing_ok=True)
     ids = ",".join(map(str, layer_ids))
+    target_sql = _sql_path(target)
+    patch_sql = _sql_path(patch)
+    temporary_sql = _sql_path(temporary)
+    sql = (
+        f"COPY (SELECT * FROM read_parquet('{target_sql}') WHERE layer_id NOT IN ({ids}) "
+        f"UNION ALL BY NAME SELECT * FROM read_parquet('{patch_sql}')) "
+        f"TO '{temporary_sql}' (FORMAT PARQUET, COMPRESSION {compression.upper()})"
+    )
     connection = duckdb.connect()
     try:
-        connection.execute(
-            f"COPY (SELECT * FROM read_parquet(?) WHERE layer_id NOT IN ({ids}) "
-            "UNION ALL BY NAME SELECT * FROM read_parquet(?)) "
-            f"TO ? (FORMAT PARQUET, COMPRESSION '{compression.upper()}')",
-            [str(target), str(patch), str(temporary)],
-        )
+        connection.execute(sql)
     finally:
         connection.close()
     pq.ParquetFile(temporary)
     os.replace(temporary, target)
+
+
+def _assert_non_target_identical(before: Path, after: Path, layer_ids: tuple[int, ...]) -> None:
+    ids = ",".join(map(str, layer_ids))
+    before_sql = _sql_path(before)
+    after_sql = _sql_path(after)
+    sql = f"""
+        SELECT COUNT(*)
+        FROM (
+            (SELECT * FROM read_parquet('{before_sql}') WHERE layer_id NOT IN ({ids})
+             EXCEPT ALL
+             SELECT * FROM read_parquet('{after_sql}') WHERE layer_id NOT IN ({ids}))
+            UNION ALL
+            (SELECT * FROM read_parquet('{after_sql}') WHERE layer_id NOT IN ({ids})
+             EXCEPT ALL
+             SELECT * FROM read_parquet('{before_sql}') WHERE layer_id NOT IN ({ids}))
+        )
+    """
+    connection = duckdb.connect()
+    try:
+        differences = int(connection.execute(sql).fetchone()[0])
+    finally:
+        connection.close()
+    if differences:
+        raise RuntimeError(f"non-ReturnCorr rows changed between {before} and {after}: {differences}")
 
 
 def _record_patch(graph_root: Path, trade_date: str, config: BuildConfig) -> None:
@@ -155,10 +188,19 @@ def build_patch_date(*, source, graph_root: Path, trade_date: str, config: Build
         target_day = graph_root / "canonical" / f"date={trade_date}"
         backup = graph_root / "patch_backups" / f"date={trade_date}"
         backup.mkdir(parents=True, exist_ok=True)
-        for name in ("edges", "node_features", "snapshots"):
-            target = target_day / f"{name}.parquet"
-            shutil.copy2(target, backup / target.name)
-            _atomic_merge_table(target, patch_day / target.name, RETURN_LAYER_IDS, config.parquet_compression)
+        names = ("edges", "node_features", "snapshots")
+        for name in names:
+            shutil.copy2(target_day / f"{name}.parquet", backup / f"{name}.parquet")
+        try:
+            for name in names:
+                target = target_day / f"{name}.parquet"
+                before = backup / f"{name}.parquet"
+                _atomic_merge_table(target, patch_day / target.name, RETURN_LAYER_IDS, config.parquet_compression)
+                _assert_non_target_identical(before, target, RETURN_LAYER_IDS)
+        except Exception:
+            for name in names:
+                shutil.copy2(backup / f"{name}.parquet", target_day / f"{name}.parquet")
+            raise
 
     _record_patch(graph_root, trade_date, config)
 
@@ -180,19 +222,12 @@ def main() -> None:
     for trade_date in args.dates:
         month = trade_date[:7]
         source = BoundMonthNodeFactorSource(monthpack, month)
-        build_patch_date(
-            source=source,
-            graph_root=graph_root,
-            trade_date=trade_date,
-            config=config,
-            workers=args.workers,
-        )
+        build_patch_date(source=source, graph_root=graph_root, trade_date=trade_date, config=config, workers=args.workers)
         print(f"patched {trade_date}")
 
-    CanonicalGraphStore(graph_root, config).initialize_dimensions(
-        pd.read_parquet(graph_root / "dimensions" / "symbols.parquet"), _layer_dimensions()
-    )
-    CanonicalGraphStore(graph_root, config).finalize_catalog()
+    store = CanonicalGraphStore(graph_root, config)
+    store.initialize_dimensions(pd.read_parquet(graph_root / "dimensions" / "symbols.parquet"), _layer_dimensions())
+    store.finalize_catalog()
 
 
 if __name__ == "__main__":
