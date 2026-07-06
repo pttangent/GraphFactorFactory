@@ -1,41 +1,70 @@
-# Phase 0 35-scale two-day smoke
+# Phase 0 35-scale two-day continuous smoke
 
 Branch: `codex/phase0-35-layer-scales`
 
-## Inputs
+## Execution
 
-- `node_factors_1m/date=2026-06-01/data.parquet`
-- `node_factors_1m/date=2026-06-02/data.parquet`
-- Decision time per day: 10:00 ET (`14:00 UTC`)
-- Universe: 1,200 symbols with at least 20 valid one-minute observations in the 30-minute source window
-- Input rows per day: 34,800
+- Real one-minute NFF data for 2026-06-01 and 2026-06-02
+- 09:30 through 10:29 ET
+- 60 consecutive decision minutes per day
+- All 35 layer/lookback configurations evaluated each minute
+- 600-symbol high-coverage universe
+- Six process workers
+- One checkpoint set per decision minute
 
-The smoke uses the real 1-minute NFF fields and constructs every registered layer/lookback combination. It does not rerun NFF.
+The run begins at the opening minute and therefore covers insufficient, partially mature, and mature windows. NFF was not rerun.
 
 ## Result
 
 | Metric | Result |
 |---|---:|
-| Expected graphs per day | 35 |
-| Days | 2 |
-| Total graph attempts | 70 |
-| Successful graphs | 70 |
-| Failed graphs | 0 |
-| Total retained edges | 209,101 |
-| 2026-06-01 elapsed | 4.86 s |
-| 2026-06-02 elapsed | 4.55 s |
+| Trading days | 2 |
+| Minutes per day | 60 |
+| Checkpoints | 120/120 |
+| Configurations per minute | 35 |
+| Total attempts | 4,200 |
+| Mature attempts | 3,564 |
+| Mature successful builds | 3,564 |
+| Correct insufficient-point results | 636 |
+| Runtime errors | 0 |
+| Retained edges | 5,067,202 |
+| Day 1 initial execution | 27.98 s |
+| Day 2 initial execution | 28.17 s |
 
-**Technical gate: PASS.**
+**Continuous technical gate: PASS.**
 
-All layer-scale configurations generated trajectories and retained edges on both days. This validates the 1-minute NFF schema path, 5/15/30-minute window slicing, internal rolling-5-minute return derivation, cross-sectional residual transforms, correlation graph path, LSH graph path, and sparse-layer execution.
+Every mature invocation built successfully. Before minimum support was available, the same path returned `insufficient_points` instead of crashing or emitting a false mature graph.
 
-## Scale matrix exercised
+## Maturity behavior
 
-- 5-minute trigger graphs: 10
-- 15-minute confirmation graphs: 11
-- 30-minute structural graphs: 14
-- Total: 35
+| Lookback | First standard-layer eligibility |
+|---:|---|
+| 5m | 09:33 ET, minimum 3 observations |
+| 15m | 09:38 ET, minimum 8 observations |
+| 30m | 09:42 ET, minimum 12 observations |
 
-## Important scope
+Return-correlation configurations use their stricter minimums. Every record includes window points, minimum points, maturity state, status, edge count, and elapsed time.
 
-This is a technical smoke, not a statistical or alpha validation. It deliberately uses one mature decision time per trading day so every configured lookback is available. Full-session production runs remain a separate performance and research validation step.
+## Resume and parallel validation
+
+The runner writes snapshot, edge, and node Parquet shards plus one completion marker per minute. A restart schedules only incomplete minutes.
+
+After all 60 first-day checkpoints existed, a second invocation recomputed zero minutes and completed report consolidation in about 3.6 seconds.
+
+The runner uses `ProcessPoolExecutor` at decision-minute granularity. The existing production pipeline process-pool architecture remains in place.
+
+## Runner
+
+`scripts/run_phase0_35_continuous_smoke.py`
+
+Example:
+
+```text
+python scripts/run_phase0_35_continuous_smoke.py --input-root NODE_FACTOR_ROOT --output OUTPUT_ROOT --dates 2026-06-01 2026-06-02 --workers 6 --universe-limit 600
+```
+
+Running the same command again resumes from existing minute checkpoints.
+
+## Scope
+
+This validates continuous time progression, opening warm-up behavior, all 35 layer-scale paths, point-in-time filtering, checkpoint recovery, and process parallelism. It is not an alpha or long-horizon stability test.
