@@ -26,6 +26,9 @@ class BuildConfig:
     split_csv_path: str | None = None
     parquet_compression: str = "zstd"
     parquet_compression_level: int = 6
+    return_corr_benchmarks: tuple[str, ...] = ("SPY", "QQQ", "IWM")
+    return_corr_min_benchmark_points: int = 8
+    return_corr_ridge: float = 1e-6
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> "BuildConfig":
@@ -33,6 +36,8 @@ class BuildConfig:
         raw = yaml.safe_load(config_path.read_text()) or {}
         if "horizons_minutes" in raw:
             raw["horizons_minutes"] = tuple(int(value) for value in raw["horizons_minutes"])
+        if "return_corr_benchmarks" in raw:
+            raw["return_corr_benchmarks"] = tuple(str(value).upper() for value in raw["return_corr_benchmarks"])
         split_path = raw.get("split_csv_path")
         if split_path:
             candidate = Path(split_path).expanduser()
@@ -46,6 +51,7 @@ class BuildConfig:
     def to_dict(self) -> dict:
         result = asdict(self)
         result["horizons_minutes"] = list(self.horizons_minutes)
+        result["return_corr_benchmarks"] = list(self.return_corr_benchmarks)
         return result
 
     @property
