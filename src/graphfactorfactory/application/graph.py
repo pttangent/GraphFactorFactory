@@ -6,6 +6,7 @@ import time
 import numpy as np
 import pandas as pd
 
+from graphfactorfactory.application.correlation import reciprocal_correlation_graph
 from graphfactorfactory.application.lsh import reciprocal_lsh_graph
 from graphfactorfactory.application.math_utils import neighbor, trajectory, zscore
 from graphfactorfactory.domain.config import BuildConfig
@@ -20,14 +21,7 @@ class SnapshotProducts:
 
 
 class MultilayerGraphBuilder:
-    def __init__(
-        self,
-        config: BuildConfig,
-        symbols: pd.DataFrame,
-        *,
-        layers: tuple[LayerDefinition, ...] | None = None,
-        include_multiplex: bool = True,
-    ):
+    def __init__(self, config: BuildConfig, symbols: pd.DataFrame, *, layers: tuple[LayerDefinition, ...] | None = None, include_multiplex: bool = True):
         self.config = config
         ordered = symbols.sort_values("symbol_id")
         self.symbols = ordered["symbol"].astype(str).tolist()
@@ -46,18 +40,13 @@ class MultilayerGraphBuilder:
         signed_flow = zscore(current[flow_column].to_numpy(dtype=np.float32))
         edge_records, node_records, snapshot_records, adjacencies = [], [], [], []
         for layer in self.layers:
-            vectors, window_points, used_columns = trajectory(
-                window,
-                layer,
-                self.symbols,
-                self.config.minimum_window_points,
-                return_corr_benchmarks=self.config.return_corr_benchmarks,
-                return_corr_min_benchmark_points=self.config.return_corr_min_benchmark_points,
-                return_corr_ridge=self.config.return_corr_ridge,
-            )
+            vectors, window_points, used_columns = trajectory(window, layer, self.symbols, self.config.minimum_window_points, return_corr_benchmarks=self.config.return_corr_benchmarks, return_corr_min_benchmark_points=self.config.return_corr_min_benchmark_points, return_corr_ridge=self.config.return_corr_ridge)
             if vectors is None:
                 continue
-            adjacency, kept_edges, lsh_bits = reciprocal_lsh_graph(vectors, self.config)
+            if layer.transform.startswith("return_corr_"):
+                adjacency, kept_edges, lsh_bits = reciprocal_correlation_graph(vectors, self.config)
+            else:
+                adjacency, kept_edges, lsh_bits = reciprocal_lsh_graph(vectors, self.config)
             adjacencies.append(adjacency)
             degree = np.diff(adjacency.indptr).astype(np.int16)
             strength = np.asarray(adjacency.sum(axis=1)).ravel().astype(np.float32)
