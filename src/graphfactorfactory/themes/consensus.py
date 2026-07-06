@@ -9,6 +9,9 @@ from .community import LeidenCommunityDetector
 from .models import LayerCommunity, ThemeCandidate
 
 
+_DISABLED_PRICE_LAYERS = {"return_corr", "return_corr_cross_sectional_residual"}
+
+
 class ConsensusThemeBuilder:
     def __init__(self, *, layer_weights=None, family_map=None, min_consensus_score=0.35, min_members=3, min_distinct_families=2, market_mode_max_member_ratio=0.15, seed=20260704):
         self.layer_weights = layer_weights or {}
@@ -23,7 +26,7 @@ class ConsensusThemeBuilder:
         pair_scores = defaultdict(float)
         pair_layers = defaultdict(set)
         for community in communities:
-            if community.is_market_mode:
+            if community.is_market_mode or community.layer_name in _DISABLED_PRICE_LAYERS:
                 continue
             weight = float(self.layer_weights.get(community.layer_name, 1.0))
             if weight <= 0:
