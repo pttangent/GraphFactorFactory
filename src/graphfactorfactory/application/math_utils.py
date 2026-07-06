@@ -23,13 +23,20 @@ def _standardize_rows(values: np.ndarray) -> np.ndarray:
     return np.divide(values, scales, out=np.zeros_like(values), where=scales > 1e-12)
 
 
-def _filled_pivot(window: pd.DataFrame, column: str, universe: list[str]) -> pd.DataFrame:
-    pivot = window.pivot_table(index="timestamp", columns="symbol", values=column, aggfunc="last").reindex(columns=universe)
+def _raw_pivot(window: pd.DataFrame, column: str, universe: list[str]) -> pd.DataFrame:
+    return window.pivot_table(index="timestamp", columns="symbol", values=column, aggfunc="last").reindex(columns=universe)
+
+
+def _fill_cross_sectional_median(pivot: pd.DataFrame) -> pd.DataFrame:
     values = pivot.to_numpy(dtype=np.float32)
     medians = np.nanmedian(values, axis=1)
     medians = np.where(np.isfinite(medians), medians, 0.0)
     values = np.where(np.isfinite(values), values, medians[:, None])
     return pd.DataFrame(values, index=pivot.index, columns=pivot.columns)
+
+
+def _filled_pivot(window: pd.DataFrame, column: str, universe: list[str]) -> pd.DataFrame:
+    return _fill_cross_sectional_median(_raw_pivot(window, column, universe))
 
 
 def return_trajectory(
@@ -43,24 +50,31 @@ def return_trajectory(
 ):
     if "ret_5m" not in window.columns:
         return None, 0, ()
-    pivot = _filled_pivot(window, "ret_5m", universe)
-    if len(pivot) < minimum_points:
+    raw_pivot = _raw_pivot(window, "ret_5m", universe)
+    if len(raw_pivot) < minimum_points:
         return None, 0, ()
+    pivot = _fill_cross_sectional_median(raw_pivot)
 
     if layer.transform == "return_corr_cross_sectional_residual":
         pivot = pivot.sub(pivot.median(axis=1), axis=0)
     elif layer.transform == "return_corr_market_residual":
-        available = [symbol for symbol in benchmarks if symbol in pivot.columns]
+        available = [
+            symbol
+            for symbol in benchmarks
+            if symbol in raw_pivot.columns
+            and int(raw_pivot[symbol].notna().sum()) >= min_benchmark_points
+            and float(raw_pivot[symbol].std(ddof=0, skipna=True) or 0.0) > 1e-12
+        ]
         if available and len(pivot) >= max(minimum_points, min_benchmark_points):
             x = pivot[available].to_numpy(dtype=np.float64)
             x = np.column_stack([np.ones(len(x)), x])
             xtx = x.T @ x
-            xtx.flat[:: xtx.shape[0] + 1] += float(ridge)
-            beta = np.linalg.solve(xtx, x.T @ pivot.to_numpy(dtype=np.float64))
+            penalty = np.eye(xtx.shape[0], dtype=np.float64) * float(ridge)
+            penalty[0, 0] = 0.0
+            beta = np.linalg.solve(xtx + penalty, x.T @ pivot.to_numpy(dtype=np.float64))
             fitted = x @ beta
             pivot = pd.DataFrame(pivot.to_numpy(dtype=np.float64) - fitted, index=pivot.index, columns=pivot.columns)
         else:
-            # Deterministic StockNet-compatible fallback when benchmark symbols are absent.
             pivot = pivot.sub(pivot.median(axis=1), axis=0)
 
     vectors = _standardize_rows(pivot.to_numpy(dtype=np.float32).T)
