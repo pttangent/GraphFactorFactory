@@ -14,6 +14,7 @@ class LayerCommunity:
     modularity: float
     is_market_mode: bool = False
     parent_community_id: int | None = None
+    leiden_seconds: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -33,6 +34,7 @@ class ThemeCandidate:
     semantic_coherence_score: float = 0.0
     theme_quality_score: float = 0.0
     quality_breakdown: dict[str, float] = field(default_factory=dict)
+    consensus_seconds: float = 0.0
 
 
 @dataclass(frozen=True)

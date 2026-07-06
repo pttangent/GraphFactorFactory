@@ -71,5 +71,7 @@ SNAPSHOT_SCHEMA = pa.schema([
     ("weight_p99", pa.float32()),
     ("top_1pct_mean_weight", pa.float32()),
     ("tail_mass_95", pa.float32()),
+    ("feature_matrix_seconds", pa.float32()),
+    ("candidate_search_seconds", pa.float32()),
     ("elapsed_ms_total_snapshot", pa.int32()),
 ])

@@ -95,6 +95,7 @@ class MultilayerGraphBuilder:
                 & (window["timestamp"] <= decision_time)
                 & (window["timestamp"] > window_start)
             ]
+            t0 = time.perf_counter()
             vectors, window_points, used_columns = trajectory(
                 scale_window,
                 layer,
@@ -104,12 +105,16 @@ class MultilayerGraphBuilder:
                 return_corr_min_benchmark_points=self.config.return_corr_min_benchmark_points,
                 return_corr_ridge=self.config.return_corr_ridge,
             )
+            t1 = time.perf_counter()
+            feature_matrix_seconds = t1 - t0
             if vectors is None:
                 continue
             if layer.transform.startswith("return_corr_"):
                 adjacency, kept_edges, lsh_bits = reciprocal_correlation_graph(vectors, graph_config)
             else:
                 adjacency, kept_edges, lsh_bits = reciprocal_lsh_graph(vectors, graph_config)
+            t2 = time.perf_counter()
+            candidate_search_seconds = t2 - t1
             if scale.scale_role == "structural":
                 structural_adjacencies.append(adjacency)
             degree = np.diff(adjacency.indptr).astype(np.int16)
@@ -150,6 +155,8 @@ class MultilayerGraphBuilder:
                 "lsh_bits": np.int16(lsh_bits),
                 "used_columns": ",".join(used_columns),
                 "transform": layer.transform,
+                "feature_matrix_seconds": np.float32(feature_matrix_seconds),
+                "candidate_search_seconds": np.float32(candidate_search_seconds),
                 **diagnostics,
             })
 
