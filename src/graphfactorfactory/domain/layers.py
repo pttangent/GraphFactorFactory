@@ -11,10 +11,12 @@ class LayerDefinition:
     family: str
     directed: bool = False
     lag_bars: int = 0
+    transform: str = "standard"
 
 
 LAYERS: tuple[LayerDefinition, ...] = (
-    LayerDefinition(1, "return_corr", ("ret_5m",), "price"),
+    # Keep the legacy raw layer for market/macro co-movement and backward compatibility.
+    LayerDefinition(1, "return_corr", ("ret_5m",), "price", transform="return_corr_raw"),
     LayerDefinition(2, "volume_expansion", ("volume_z_30m", "dollar_volume_z_30m"), "activity"),
     LayerDefinition(3, "trade_intensity", ("trade_count_z_30m", "avg_trade_size"), "activity"),
     LayerDefinition(4, "signed_flow", ("volume_ofi_proxy", "count_ofi_proxy", "signed_dollar_flow"), "trade_flow"),
@@ -27,6 +29,10 @@ LAYERS: tuple[LayerDefinition, ...] = (
     LayerDefinition(11, "absorption", ("absorption_proxy", "flow_absorption_proxy"), "liquidity"),
     LayerDefinition(12, "flow_return_alignment", ("flow_return_alignment",), "interaction"),
     LayerDefinition(13, "report_latency", ("avg_report_lag_ns", "max_report_lag_ns", "correction_excluded_share"), "data_quality"),
+    # Market-neutral theme layer: regress each stock on SPY/QQQ/IWM before correlation.
+    LayerDefinition(14, "return_corr_market_residual", ("ret_5m",), "price", transform="return_corr_market_residual"),
+    # StockNet-compatible fallback: remove the cross-sectional median return per timestamp.
+    LayerDefinition(15, "return_corr_cross_sectional_residual", ("ret_5m",), "price", transform="return_corr_cross_sectional_residual"),
 )
 
 LAYER_BY_ID = {layer.layer_id: layer for layer in LAYERS}
