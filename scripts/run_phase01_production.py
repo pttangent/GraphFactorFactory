@@ -25,10 +25,17 @@ def run_day(pipeline,day,workers):
     node_map={t:nodes[nodes.decision_time==t] for t in times}
     universe_count=len(pd.read_parquet(pipeline.graph_root/'dimensions'/'symbols.parquet'))
     tasks=[(t,prepared[t],pipeline.detector,pipeline.consensus,pipeline.layer_name,universe_count,pipeline.config.run_id) for t in times]
+    import logging
+    logger = logging.getLogger("Phase1")
+    logger.info(f"Phase 1: Submitted {len(tasks)} frames for community detection.")
     detected={}
     with ProcessPoolExecutor(max_workers=max(1,workers)) as pool:
+        completed = 0
         for f in as_completed([pool.submit(detect_snapshot,x) for x in tasks]):
             t,p,c,themes=f.result();detected[t]=(p,c,themes)
+            completed += 1
+            if completed % max(1, len(tasks) // 10) == 0 or completed == len(tasks):
+                logger.info(f"Phase 1 Progress: {completed}/{len(tasks)} frames completed ({(completed/len(tasks))*100:.1f}%)")
     previous=[];records={};community_count=theme_count=0
     for t in times:
         p,c,themes=detected[t]
