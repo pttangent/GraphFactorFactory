@@ -9,7 +9,7 @@ import pandas as pd
 from graphfactorfactory.application.lsh import reciprocal_lsh_graph
 from graphfactorfactory.application.math_utils import neighbor, trajectory, zscore
 from graphfactorfactory.domain.config import BuildConfig
-from graphfactorfactory.domain.layers import LAYERS
+from graphfactorfactory.domain.layers import LAYERS, LayerDefinition
 
 
 @dataclass
@@ -20,11 +20,20 @@ class SnapshotProducts:
 
 
 class MultilayerGraphBuilder:
-    def __init__(self, config: BuildConfig, symbols: pd.DataFrame):
+    def __init__(
+        self,
+        config: BuildConfig,
+        symbols: pd.DataFrame,
+        *,
+        layers: tuple[LayerDefinition, ...] | None = None,
+        include_multiplex: bool = True,
+    ):
         self.config = config
         ordered = symbols.sort_values("symbol_id")
         self.symbols = ordered["symbol"].astype(str).tolist()
         self.symbol_ids = ordered["symbol_id"].astype("int32").to_numpy()
+        self.layers = tuple(layers or LAYERS)
+        self.include_multiplex = bool(include_multiplex)
 
     def build_snapshot(self, window: pd.DataFrame, decision_time) -> SnapshotProducts:
         started = time.perf_counter()
@@ -36,7 +45,7 @@ class MultilayerGraphBuilder:
         flow_column = "signed_dollar_flow" if "signed_dollar_flow" in current.columns else "signed_dollar_flow_proxy"
         signed_flow = zscore(current[flow_column].to_numpy(dtype=np.float32))
         edge_records, node_records, snapshot_records, adjacencies = [], [], [], []
-        for layer in LAYERS:
+        for layer in self.layers:
             vectors, window_points, used_columns = trajectory(
                 window,
                 layer,
@@ -60,7 +69,7 @@ class MultilayerGraphBuilder:
             for index, symbol_id in enumerate(self.symbol_ids):
                 node_records.append({"decision_time": decision_time, "layer_id": np.int16(layer.layer_id), "symbol_id": np.int32(symbol_id), "degree": degree[index], "strength": strength[index], "core_z": np.float32(core[index]), "neighbor_reversal": neighbor_reversal[index], "neighbor_signed_flow": neighbor_flow[index], "layer_participation": np.float32(degree[index] > 0)})
             snapshot_records.append({"decision_time": decision_time, "window_start": window_start, "window_end": decision_time, "layer_id": np.int16(layer.layer_id), "universe_count": np.int32(len(self.symbols)), "active_nodes": np.int32((degree > 0).sum()), "edge_count": np.int32(len(kept_edges)), "mean_degree": np.float32(degree.mean()), "mean_strength": np.float32(strength.mean()), "window_points": np.int16(window_points), "vector_dimension": np.int16(vectors.shape[1]), "lsh_bits": np.int16(lsh_bits), "used_columns": ",".join(used_columns), "transform": layer.transform})
-        if adjacencies:
+        if self.include_multiplex and adjacencies:
             multiplex = sum(adjacencies) / np.float32(len(adjacencies))
             degree = np.diff(multiplex.indptr).astype(np.int16)
             strength = np.asarray(multiplex.sum(axis=1)).ravel().astype(np.float32)
