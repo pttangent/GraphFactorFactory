@@ -4,7 +4,6 @@ import numpy as np
 from scipy import sparse
 
 from graphfactorfactory.domain.config import BuildConfig
-from graphfactorfactory.application.lsh import strict_degree_cap
 
 
 def reciprocal_correlation_graph(values: np.ndarray, config: BuildConfig):
@@ -43,7 +42,15 @@ def reciprocal_correlation_graph(values: np.ndarray, config: BuildConfig):
             right_weight, right_rank = reverse
             reciprocal.append((left, right, (left_weight + right_weight) / 2.0, left_rank, right_rank))
 
-    kept = strict_degree_cap(reciprocal, config.degree_cap)
+    incident: dict[int, list[tuple[float, int, int]]] = {}
+    for left, right, weight, _, _ in reciprocal:
+        incident.setdefault(left, []).append((weight, left, right))
+        incident.setdefault(right, []).append((weight, left, right))
+    keep_counts: dict[tuple[int, int], int] = {}
+    for node_edges in incident.values():
+        for _, left, right in sorted(node_edges, reverse=True)[: config.degree_cap]:
+            keep_counts[(left, right)] = keep_counts.get((left, right), 0) + 1
+    kept = [edge for edge in reciprocal if keep_counts.get((edge[0], edge[1]), 0) == 2]
 
     rows: list[int] = []
     columns: list[int] = []

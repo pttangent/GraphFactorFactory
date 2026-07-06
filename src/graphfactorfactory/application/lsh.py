@@ -6,27 +6,6 @@ from scipy import sparse
 from graphfactorfactory.domain.config import BuildConfig
 
 
-def strict_degree_cap(edges: list[tuple[int, int, float, int, int]], degree_cap: int):
-    """Deterministically keep the strongest edges without exceeding either endpoint cap.
-
-    The previous implementation selected the top-N incident edges per node and then took
-    their union. That union can exceed the requested cap at the opposite endpoint. This
-    global greedy b-matching approximation enforces the invariant for both endpoints.
-    """
-    if degree_cap <= 0 or not edges:
-        return []
-    degree: dict[int, int] = {}
-    kept = []
-    for edge in sorted(edges, key=lambda item: (-float(item[2]), int(item[0]), int(item[1]))):
-        left, right = int(edge[0]), int(edge[1])
-        if degree.get(left, 0) >= degree_cap or degree.get(right, 0) >= degree_cap:
-            continue
-        kept.append(edge)
-        degree[left] = degree.get(left, 0) + 1
-        degree[right] = degree.get(right, 0) + 1
-    return kept
-
-
 def reciprocal_lsh_graph(values: np.ndarray, config: BuildConfig):
     values = np.asarray(values, dtype=np.float32)
     norms = np.linalg.norm(values, axis=1, keepdims=True)
@@ -70,8 +49,15 @@ def reciprocal_lsh_graph(values: np.ndarray, config: BuildConfig):
         if left < right and reverse is not None:
             right_weight, right_rank = reverse
             reciprocal.append((left, right, (left_weight + right_weight) / 2.0, left_rank, right_rank))
-
-    kept = strict_degree_cap(reciprocal, config.degree_cap)
+    incident: dict[int, list[tuple[float, int, int]]] = {}
+    for left, right, weight, _, _ in reciprocal:
+        incident.setdefault(left, []).append((weight, left, right))
+        incident.setdefault(right, []).append((weight, left, right))
+    keep_counts: dict[tuple[int, int], int] = {}
+    for values_for_node in incident.values():
+        for _, left, right in sorted(values_for_node, reverse=True)[: config.degree_cap]:
+            keep_counts[(left, right)] = keep_counts.get((left, right), 0) + 1
+    kept = [edge for edge in reciprocal if keep_counts.get((edge[0], edge[1]), 0) == 2]
     rows, columns, weights = [], [], []
     for left, right, weight, _, _ in kept:
         rows.extend((left, right))

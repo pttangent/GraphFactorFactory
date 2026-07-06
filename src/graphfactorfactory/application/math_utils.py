@@ -39,20 +39,6 @@ def _filled_pivot(window: pd.DataFrame, column: str, universe: list[str]) -> pd.
     return _fill_cross_sectional_median(_raw_pivot(window, column, universe))
 
 
-def _return_source(window: pd.DataFrame, layer: LayerDefinition, universe: list[str]):
-    if layer.transform == "return_corr_cross_sectional_rolling_5m":
-        source = "log_ret_1m" if "log_ret_1m" in window.columns else "ret_1m"
-        if source not in window.columns:
-            return None, ()
-        raw = _raw_pivot(window, source, universe).sort_index()
-        rolled = raw.rolling(window=5, min_periods=5).sum().dropna(how="all")
-        return rolled, (source,)
-    source = "ret_1m" if "ret_1m" in window.columns else "log_ret_1m"
-    if source not in window.columns:
-        return None, ()
-    return _raw_pivot(window, source, universe).sort_index(), (source,)
-
-
 def return_trajectory(
     window: pd.DataFrame,
     layer: LayerDefinition,
@@ -62,18 +48,38 @@ def return_trajectory(
     min_benchmark_points: int,
     ridge: float,
 ):
-    del benchmarks, min_benchmark_points, ridge
-    raw_pivot, used_columns = _return_source(window, layer, universe)
-    if raw_pivot is None or len(raw_pivot) < minimum_points:
+    ret_col = "ret_1m" if "ret_1m" in window.columns else "ret_5m"
+    if ret_col not in window.columns:
+        return None, 0, ()
+    raw_pivot = _raw_pivot(window, ret_col, universe)
+    if len(raw_pivot) < minimum_points:
         return None, 0, ()
     pivot = _fill_cross_sectional_median(raw_pivot)
-    if layer.transform in {
-        "return_corr_cross_sectional_1m",
-        "return_corr_cross_sectional_rolling_5m",
-    }:
+
+    if layer.transform == "return_corr_cross_sectional_residual":
         pivot = pivot.sub(pivot.median(axis=1), axis=0)
+    elif layer.transform == "return_corr_market_residual":
+        available = [
+            symbol
+            for symbol in benchmarks
+            if symbol in raw_pivot.columns
+            and int(raw_pivot[symbol].notna().sum()) >= min_benchmark_points
+            and float(raw_pivot[symbol].std(ddof=0, skipna=True) or 0.0) > 1e-12
+        ]
+        if available and len(pivot) >= max(minimum_points, min_benchmark_points):
+            x = pivot[available].to_numpy(dtype=np.float64)
+            x = np.column_stack([np.ones(len(x)), x])
+            xtx = x.T @ x
+            penalty = np.eye(xtx.shape[0], dtype=np.float64) * float(ridge)
+            penalty[0, 0] = 0.0
+            beta = np.linalg.solve(xtx + penalty, x.T @ pivot.to_numpy(dtype=np.float64))
+            fitted = x @ beta
+            pivot = pd.DataFrame(pivot.to_numpy(dtype=np.float64) - fitted, index=pivot.index, columns=pivot.columns)
+        else:
+            pivot = pivot.sub(pivot.median(axis=1), axis=0)
+
     vectors = _standardize_rows(pivot.to_numpy(dtype=np.float32).T)
-    return vectors, len(pivot), used_columns
+    return vectors, len(pivot), (ret_col,)
 
 
 def trajectory(
