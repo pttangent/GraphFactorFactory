@@ -2,12 +2,12 @@ frequency: 1min
 market_timezone: America/New_York
 market_open: "09:30"
 market_close: "16:00"
-graph_window_minutes: 60
+graph_window_minutes: 30
 graph_step_minutes: 1
 top_k: 8
 degree_cap: 6
 minimum_similarity: 0.10
-minimum_window_points: 8
+minimum_window_points: 3
 horizons_minutes: [5, 15, 30, 60, 120]
 store_labels: true
 store_qlib_cache: false
