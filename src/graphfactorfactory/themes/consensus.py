@@ -26,6 +26,8 @@ class ConsensusThemeBuilder:
             if community.is_market_mode:
                 continue
             weight = float(self.layer_weights.get(community.layer_name, 1.0))
+            if weight <= 0:
+                continue
             for left, right in combinations(sorted(community.members), 2):
                 pair_scores[(left, right)] += weight
                 pair_layers[(left, right)].add(community.layer_name)
