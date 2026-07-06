@@ -25,7 +25,7 @@ class LayerScaleDefinition:
 
 
 _SCALE_ROLES = {5: "trigger", 15: "confirm", 30: "structural"}
-_SCALE_STEPS = {5: 1, 15: 1, 30: 5}
+_SCALE_STEPS = {5: 1, 15: 1, 30: 1}
 
 
 LAYERS: tuple[LayerDefinition, ...] = (
@@ -76,6 +76,5 @@ def layer_scale_definitions(layers: tuple[LayerDefinition, ...] | None = None) -
 
 LAYER_SCALES = layer_scale_definitions()
 MAX_LOOKBACK_MINUTES = max(item.lookback_minutes for item in LAYER_SCALES)
-
 LAYER_BY_ID = {layer.layer_id: layer for layer in LAYERS}
 LAYER_BY_NAME = {layer.name: layer for layer in LAYERS}
