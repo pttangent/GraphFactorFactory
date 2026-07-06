@@ -10,16 +10,16 @@ import yaml
 
 @dataclass(frozen=True)
 class BuildConfig:
-    frequency: str = "5min"
+    frequency: str = "1min"
     market_timezone: str = "America/New_York"
     market_open: str = "09:30"
     market_close: str = "16:00"
-    graph_window_minutes: int = 60
-    graph_step_minutes: int = 15
+    graph_window_minutes: int = 30
+    graph_step_minutes: int = 1
     top_k: int = 8
     degree_cap: int = 6
     minimum_similarity: float = 0.10
-    minimum_window_points: int = 8
+    minimum_window_points: int = 3
     horizons_minutes: tuple[int, ...] = (5, 15, 30, 60, 120)
     store_labels: bool = True
     store_qlib_cache: bool = False
