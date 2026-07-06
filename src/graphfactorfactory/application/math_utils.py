@@ -16,24 +16,88 @@ def zscore(values: np.ndarray) -> np.ndarray:
     return np.nan_to_num((values - mean) / std)
 
 
-def trajectory(window: pd.DataFrame, layer: LayerDefinition, universe: list[str], minimum_points: int):
+def _standardize_rows(values: np.ndarray) -> np.ndarray:
+    values = np.asarray(values, dtype=np.float32)
+    values = values - values.mean(axis=1, keepdims=True)
+    scales = values.std(axis=1, keepdims=True)
+    return np.divide(values, scales, out=np.zeros_like(values), where=scales > 1e-12)
+
+
+def _filled_pivot(window: pd.DataFrame, column: str, universe: list[str]) -> pd.DataFrame:
+    pivot = window.pivot_table(index="timestamp", columns="symbol", values=column, aggfunc="last").reindex(columns=universe)
+    values = pivot.to_numpy(dtype=np.float32)
+    medians = np.nanmedian(values, axis=1)
+    medians = np.where(np.isfinite(medians), medians, 0.0)
+    values = np.where(np.isfinite(values), values, medians[:, None])
+    return pd.DataFrame(values, index=pivot.index, columns=pivot.columns)
+
+
+def return_trajectory(
+    window: pd.DataFrame,
+    layer: LayerDefinition,
+    universe: list[str],
+    minimum_points: int,
+    benchmarks: tuple[str, ...],
+    min_benchmark_points: int,
+    ridge: float,
+):
+    if "ret_5m" not in window.columns:
+        return None, 0, ()
+    pivot = _filled_pivot(window, "ret_5m", universe)
+    if len(pivot) < minimum_points:
+        return None, 0, ()
+
+    if layer.transform == "return_corr_cross_sectional_residual":
+        pivot = pivot.sub(pivot.median(axis=1), axis=0)
+    elif layer.transform == "return_corr_market_residual":
+        available = [symbol for symbol in benchmarks if symbol in pivot.columns]
+        if available and len(pivot) >= max(minimum_points, min_benchmark_points):
+            x = pivot[available].to_numpy(dtype=np.float64)
+            x = np.column_stack([np.ones(len(x)), x])
+            xtx = x.T @ x
+            xtx.flat[:: xtx.shape[0] + 1] += float(ridge)
+            beta = np.linalg.solve(xtx, x.T @ pivot.to_numpy(dtype=np.float64))
+            fitted = x @ beta
+            pivot = pd.DataFrame(pivot.to_numpy(dtype=np.float64) - fitted, index=pivot.index, columns=pivot.columns)
+        else:
+            # Deterministic StockNet-compatible fallback when benchmark symbols are absent.
+            pivot = pivot.sub(pivot.median(axis=1), axis=0)
+
+    vectors = _standardize_rows(pivot.to_numpy(dtype=np.float32).T)
+    return vectors, len(pivot), ("ret_5m",)
+
+
+def trajectory(
+    window: pd.DataFrame,
+    layer: LayerDefinition,
+    universe: list[str],
+    minimum_points: int,
+    *,
+    return_corr_benchmarks: tuple[str, ...] = ("SPY", "QQQ", "IWM"),
+    return_corr_min_benchmark_points: int = 8,
+    return_corr_ridge: float = 1e-6,
+):
+    if layer.transform.startswith("return_corr_"):
+        return return_trajectory(
+            window,
+            layer,
+            universe,
+            minimum_points,
+            return_corr_benchmarks,
+            return_corr_min_benchmark_points,
+            return_corr_ridge,
+        )
+
     blocks: list[np.ndarray] = []
     timestamps = 0
     used_columns: list[str] = []
     for column in layer.columns:
         if column not in window.columns:
             continue
-        pivot = window.pivot_table(index="timestamp", columns="symbol", values=column, aggfunc="last").reindex(columns=universe)
+        pivot = _filled_pivot(window, column, universe)
         if len(pivot) < minimum_points:
             continue
-        values = pivot.to_numpy(dtype=np.float32).T
-        medians = np.nanmedian(values, axis=0)
-        medians = np.where(np.isfinite(medians), medians, 0.0)
-        values = np.where(np.isfinite(values), values, medians)
-        values -= values.mean(axis=1, keepdims=True)
-        scales = values.std(axis=1, keepdims=True)
-        values = np.divide(values, scales, out=np.zeros_like(values), where=scales > 1e-12)
-        blocks.append(values)
+        blocks.append(_standardize_rows(pivot.to_numpy(dtype=np.float32).T))
         timestamps = max(timestamps, len(pivot))
         used_columns.append(column)
     if not blocks:
