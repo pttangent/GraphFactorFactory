@@ -1,0 +1,37 @@
+frequency: 1min
+market_timezone: America/New_York
+market_open: "09:30"
+market_close: "16:00"
+graph_window_minutes: 30
+graph_step_minutes: 1
+top_k: 6
+degree_cap: 4
+minimum_similarity: 0.30
+minimum_window_points: 3
+horizons_minutes: [5, 15, 30, 60, 120]
+store_labels: true
+store_qlib_cache: false
+split_csv_path: data/splits.csv
+parquet_compression: zstd
+parquet_compression_level: 6
+return_corr_benchmarks: [SPY, QQQ, IWM]
+return_corr_min_benchmark_points: 8
+return_corr_ridge: 1.0e-6
+
+graph_parameter_overrides:
+  scale:volume_expansion:5:
+    top_k: 8
+    degree_cap: 6
+    minimum_similarity: 0.10
+  scale:volume_expansion:15:
+    top_k: 8
+    degree_cap: 6
+    minimum_similarity: 0.10
+  scale:signed_flow:5:
+    top_k: 8
+    degree_cap: 6
+    minimum_similarity: 0.10
+  scale:flow_return_alignment:5:
+    top_k: 8
+    degree_cap: 6
+    minimum_similarity: 0.10
