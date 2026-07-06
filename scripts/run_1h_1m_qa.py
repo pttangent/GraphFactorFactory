@@ -21,7 +21,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger("1H_1M_QA")
 
 
-def _et_mask(series, start="10:00", end="10:59"):
+def _et_mask(series, start="10:00", end="10:15"):
     local = pd.to_datetime(series, utc=True).dt.tz_convert("America/New_York")
     hhmm = local.dt.strftime("%H:%M")
     return (hhmm >= start) & (hhmm <= end)
@@ -44,7 +44,7 @@ def run_qa(month_pack_root, graph_root, theme_root, workers, config_path, overwr
         raise FileExistsError("QA output already exists; use new roots or --overwrite")
 
     config = BuildConfig.from_yaml(config_path)
-    config = replace(config, frequency="1min", market_open="09:30", market_close="10:59", graph_step_minutes=1)
+    config = replace(config, frequency="1min", market_open="09:30", market_close="10:15", graph_step_minutes=1)
     if config.graph_step_minutes != 1:
         raise AssertionError("graph_step_minutes must equal 1")
     bad_steps = [
@@ -89,7 +89,7 @@ def run_qa(month_pack_root, graph_root, theme_root, workers, config_path, overwr
     temporal_edges = pd.read_parquet(day_theme / "temporal_edges.parquet")
     temporal_edges = temporal_edges[_et_mask(temporal_edges["decision_time"])].copy()
 
-    expected_frames = 60
+    expected_frames = 16
     expected_scales = len(LAYER_SCALES)
     expected_rows = expected_frames * expected_scales
     snapshot_keys = ["decision_time", "layer_id", "lookback_minutes"]
@@ -129,7 +129,7 @@ def run_qa(month_pack_root, graph_root, theme_root, workers, config_path, overwr
 
     report = {
         "date": date,
-        "window_et": "10:00-10:59",
+        "window_et": "10:00-10:15",
         "config_path": str(Path(config_path).resolve()),
         "parameter_set_id": config.parameter_set_id,
         "config_hash": config.config_hash,
