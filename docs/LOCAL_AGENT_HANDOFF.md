@@ -1,0 +1,1 @@
+Read the ReturnCorr implementation and rerun Phase 0, Phase 1, and Phase 2 in order. Use the Phase 0 ReturnCorr patch for layers 1, 14, and 15. Phase 1 must be rerun because its community inputs changed. Phase 2 must then be rerun chronologically. Do not reuse old community or lifecycle outputs.
