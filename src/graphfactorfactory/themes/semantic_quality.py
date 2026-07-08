@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections import Counter
 from dataclasses import replace
 import pandas as pd
@@ -18,17 +19,55 @@ class MetadataSemanticLabeler:
         output=[]
         for theme in themes:
             rows = self.metadata.reindex(theme.members).dropna(how="all") if not self.metadata.empty else pd.DataFrame()
+            symbols = rows.get("symbol", pd.Series(index=rows.index, dtype=str)).dropna().astype(str).tolist()[:5]
             sectors = Counter(rows.get("sector", pd.Series(dtype=str)).dropna().astype(str))
             industries = Counter(rows.get("industry", pd.Series(dtype=str)).dropna().astype(str))
             companies = rows.get("company", pd.Series(index=rows.index, dtype=str)).dropna().astype(str).tolist()[:5]
+            
+            total_valid = len(rows.get("sector", pd.Series()).dropna()) or 1
+            sector_dist = {k: float(v/total_valid) for k, v in sectors.most_common(5)}
+            total_valid_ind = len(rows.get("industry", pd.Series()).dropna()) or 1
+            industry_dist = {k: float(v/total_valid_ind) for k, v in industries.most_common(5)}
+            
             sector = sectors.most_common(1)[0][0] if sectors else "Mixed"
             industry = industries.most_common(1)[0][0] if industries else "Mixed"
+            
+            market_cap_bucket = "Unknown"
+            if "market_cap" in rows and not rows["market_cap"].dropna().empty:
+                med_cap = rows["market_cap"].median()
+                if med_cap >= 200e9: market_cap_bucket = "Mega-Cap"
+                elif med_cap >= 10e9: market_cap_bucket = "Large-Cap"
+                elif med_cap >= 2e9: market_cap_bucket = "Mid-Cap"
+                elif med_cap >= 300e6: market_cap_bucket = "Small-Cap"
+                else: market_cap_bucket = "Micro-Cap"
+            
             tags = tuple(sorted(set(theme.source_families) | ({sector} if sector != "Mixed" else set()) | ({industry} if industry != "Mixed" else set())))
             coherence = (sectors.most_common(1)[0][1] / len(rows)) if sectors and len(rows) else min(1.0, 0.4 + 0.1 * len(theme.source_families))
             fallback = [str(value) for value in theme.members[:3]]
-            title_members = companies[:3] or fallback
-            short = f"{sector}/{industry}: {', '.join(title_members)}"
-            output.append(SemanticLabel(theme.theme_instance_id, short, short, sector, industry, tags, tuple(companies), float(coherence), "Deterministic metadata-first label from members and supporting layer families.", "metadata_dictionary", self.dictionary_version))
+            title_members = symbols[:3] or fallback
+            
+            if theme.is_market_mode:
+                short = f"Market Mode: {sector}/{industry} ({market_cap_bucket})"
+            else:
+                short = f"{sector}/{industry} ({market_cap_bucket}): {', '.join(title_members)}"
+            
+            output.append(SemanticLabel(
+                theme_instance_id=theme.theme_instance_id,
+                label_short=short,
+                label_long=short,
+                sector_summary=sector,
+                industry_summary=industry,
+                tags=tags,
+                top_companies=tuple(companies),
+                top_symbols=tuple(symbols),
+                sector_distribution=json.dumps(sector_dist),
+                industry_distribution=json.dumps(industry_dist),
+                market_cap_bucket=market_cap_bucket,
+                semantic_coherence_score=float(coherence),
+                explanation="Deterministic metadata-first label from members and supporting layer families.",
+                semantic_method="metadata_dictionary",
+                dictionary_version=self.dictionary_version
+            ))
         return output
 
 

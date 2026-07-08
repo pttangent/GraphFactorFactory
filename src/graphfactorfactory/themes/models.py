@@ -62,6 +62,10 @@ class SemanticLabel:
     industry_summary: str
     tags: tuple[str, ...]
     top_companies: tuple[str, ...]
+    top_symbols: tuple[str, ...]
+    sector_distribution: str
+    industry_distribution: str
+    market_cap_bucket: str
     semantic_coherence_score: float
     explanation: str
     semantic_method: str

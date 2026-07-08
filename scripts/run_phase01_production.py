@@ -51,12 +51,24 @@ def run_day(pipeline,day,workers):
     return target
 
 def main():
+    import logging, sys
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", stream=sys.stdout, force=True)
     p=argparse.ArgumentParser()
     p.add_argument('--graph-root',required=True);p.add_argument('--theme-root',required=True)
     p.add_argument('--date-start');p.add_argument('--date-end');p.add_argument('--workers',type=int,default=16)
     p.add_argument('--run-id',default='phase01_production_v1')
+    p.add_argument('--metadata',default='D:/DEV/US-Stock/GraphFactorFactory/data/metadata/symbol_metadata.parquet')
     a=p.parse_args()
-    pipe=ThemeDiscoveryPipeline(a.graph_root,a.theme_root,ThemeDiscoveryConfig(run_id=a.run_id,frame_minutes=5))
+    
+    metadata = None
+    try:
+        symbols = pd.read_parquet(Path(a.graph_root) / "dimensions" / "symbols.parquet")
+        meta = pd.read_parquet(a.metadata)
+        metadata = pd.merge(symbols, meta, on='symbol', how='left')
+    except Exception as e:
+        logging.warning(f"Failed to load metadata: {e}")
+        
+    pipe=ThemeDiscoveryPipeline(a.graph_root,a.theme_root,ThemeDiscoveryConfig(run_id=a.run_id,frame_minutes=1), metadata=metadata)
     done=0
     for day in sorted((Path(a.graph_root)/'canonical').glob('date=*')):
         d=day.name.split('=',1)[1]
