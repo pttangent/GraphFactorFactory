@@ -64,6 +64,11 @@ def main():
     try:
         symbols = pd.read_parquet(Path(a.graph_root) / "dimensions" / "symbols.parquet")
         meta = pd.read_parquet(a.metadata)
+        meta = meta.rename(columns={
+            "company_name": "company",
+            "sector_code": "sector",
+            "industry_code": "industry",
+        })
         metadata = pd.merge(symbols, meta, on='symbol', how='left')
     except Exception as e:
         logging.warning(f"Failed to load metadata: {e}")
