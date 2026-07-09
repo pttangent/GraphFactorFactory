@@ -1,0 +1,4 @@
+penalty_start_depth,groups,avg_leaf_count,median_leaf_size,p90_leaf_size,max_leaf_size,mean_top_sector_share,median_top_sector_share,sector_pure_60,sector_pure_80
+1,16,127.0625,10.0,18.0,61,0.29544693446189985,0.28201493474009354,10,0
+2,16,138.8125,11.0,20.0,44,0.2891624993897031,0.27393203271152455,9,0
+3,16,138.8125,11.0,20.0,44,0.2891624993897031,0.27393203271152455,9,0
