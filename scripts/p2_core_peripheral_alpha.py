@@ -26,45 +26,53 @@ for d in all_dates:
     df_mem['member_id'] = df_mem['member_id'].astype(int)
     df_lbl['symbol_id'] = df_lbl['symbol_id'].astype(int)
     
-    # Create past labels by shifting decision_time forward
     df_lbl_past = df_lbl[['decision_time', 'symbol_id', 'label_15m']].copy()
-    # If decision_time was 09:30, its forward 15m return is the past 15m return at 09:45
     df_lbl_past['decision_time'] = df_lbl_past['decision_time'] + pd.Timedelta(minutes=15)
     df_lbl_past = df_lbl_past.rename(columns={'label_15m': 'past_ret_15m'})
     
-    # Merge current forward labels and past labels
     df_lbl_combined = pd.merge(df_lbl, df_lbl_past, on=['decision_time', 'symbol_id'], how='inner')
-    
-    # Merge with memberships
     df = pd.merge(df_mem, df_lbl_combined, left_on=['decision_time', 'member_id'], right_on=['decision_time', 'symbol_id'], how='inner')
     
     if df.empty:
         continue
         
-    # For each theme (decision_time, layer_id, scale, theme_id), identify core and peripheral
-    def calc_diffusion(g):
-        g = g.sort_values('core_score', ascending=False)
-        n = len(g)
-        if n < 5:
-            return pd.DataFrame()
-            
-        n_core = max(1, int(n * 0.2))
-        n_peri = max(1, int(n * 0.5))
+    # Vectorized computation
+    group_cols = ['decision_time', 'layer_id', 'scale', 'theme_id']
+    
+    # Sort by group and core_score descending
+    df = df.sort_values(group_cols + ['core_score'], ascending=[True, True, True, True, False])
+    
+    # Count members per group
+    counts = df.groupby(group_cols).size()
+    # Filter groups with >= 5 members
+    valid_groups = counts[counts >= 5].index
+    df = df[df.set_index(group_cols).index.isin(valid_groups)]
+    
+    if df.empty:
+        continue
         
-        core_members = g.head(n_core)
-        peri_members = g.tail(n_peri).copy()
-        
-        # Calculate core past return
-        core_past_ret = core_members['past_ret_15m'].mean()
-        
-        # Signal for peripheral
-        # peripheral_score = core_past_ret * (max_core_score - member_core_score)
-        max_core = g['core_score'].max()
-        peri_members['peri_signal'] = core_past_ret * (max_core - peri_members['core_score'])
-        
-        return peri_members[['decision_time', 'symbol_id', 'peri_signal', 'label_5m', 'label_15m', 'label_30m', 'label_60m']]
-        
-    res = df.groupby(['decision_time', 'layer_id', 'scale', 'theme_id']).apply(calc_diffusion).reset_index(drop=True)
+    # Assign rank within group
+    df['rank'] = df.groupby(group_cols).cumcount()
+    df['group_size'] = df.groupby(group_cols)['rank'].transform('size')
+    
+    # Identify core and peripheral
+    df['is_core'] = df['rank'] < np.maximum(1, (df['group_size'] * 0.2).astype(int))
+    df['is_peri'] = df['rank'] >= (df['group_size'] - np.maximum(1, (df['group_size'] * 0.5).astype(int)))
+    
+    # Calculate core past return per group
+    core_past_ret = df[df['is_core']].groupby(group_cols)['past_ret_15m'].mean().rename('core_past_ret')
+    # Calculate max core score per group
+    max_core = df.groupby(group_cols)['core_score'].max().rename('max_core_score')
+    
+    # Join back to peri members
+    peri_df = df[df['is_peri']].copy()
+    peri_df = peri_df.join(core_past_ret, on=group_cols)
+    peri_df = peri_df.join(max_core, on=group_cols)
+    
+    # Signal
+    peri_df['peri_signal'] = peri_df['core_past_ret'] * (peri_df['max_core_score'] - peri_df['core_score'])
+    
+    res = peri_df[['decision_time', 'symbol_id', 'peri_signal', 'label_5m', 'label_15m', 'label_30m', 'label_60m']]
     all_results.append(res)
 
 if all_results:
