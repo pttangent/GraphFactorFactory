@@ -104,6 +104,7 @@ def read_edges(path: Path) -> pd.DataFrame:
 
     cols = ["decision_time", "layer_id", "scale", "src_id", "dst_id", "weight"]
     out = out[cols]
+    out = out.dropna(subset=["src_id", "dst_id"])
     out["src_id"] = out["src_id"].astype(int)
     out["dst_id"] = out["dst_id"].astype(int)
     out["weight"] = pd.to_numeric(out["weight"], errors="coerce").fillna(0.0).astype(float)
