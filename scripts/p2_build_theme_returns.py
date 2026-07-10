@@ -37,39 +37,52 @@ def process_date(d):
     df_mem['decision_time'] = pd.to_datetime(df_mem['decision_time'], utc=True)
     df_lbl['decision_time'] = pd.to_datetime(df_lbl['decision_time'], utc=True)
     
-    df = pd.merge(df_mem, df_lbl, left_on=["decision_time", "member_id"], right_on=["decision_time", "symbol_id"], how="inner")
+    # Process by decision_time chunk to save memory
+    chunk_results = []
     
-    if df.empty: return False
+    for dt, mem_group in df_mem.groupby('decision_time'):
+        lbl_group = df_lbl[df_lbl['decision_time'] == dt]
+        if lbl_group.empty:
+            continue
+            
+        df = pd.merge(mem_group, lbl_group, left_on=["decision_time", "member_id"], right_on=["decision_time", "symbol_id"], how="inner")
+        if df.empty:
+            continue
+            
+        group_cols = ["decision_time", "layer_id", "scale", "level", "theme_id"]
+        df = df.sort_values("core_score", ascending=False)
         
-    group_cols = ["decision_time", "layer_id", "scale", "level", "theme_id"]
-    df = df.sort_values("core_score", ascending=False)
-    
-    avail_horizons = [h for h in horizons if f"label_{h}" in df.columns]
-    for h in avail_horizons:
-        df[f'weighted_{h}'] = df[f'label_{h}'] * df['core_score']
+        avail_horizons = [h for h in horizons if f"label_{h}" in df.columns]
+        for h in avail_horizons:
+            df[f'weighted_{h}'] = df[f'label_{h}'] * df['core_score']
+            
+        grouped = df.groupby(group_cols)
+        res = grouped[[f"label_{h}" for h in avail_horizons]].mean()
+        res.columns = [f"ret_eq_{h}" for h in avail_horizons]
         
-    grouped = df.groupby(group_cols)
-    res = grouped[[f"label_{h}" for h in avail_horizons]].mean()
-    res.columns = [f"ret_eq_{h}" for h in avail_horizons]
-    
-    w_sum = grouped['core_score'].sum()
-    for h in avail_horizons:
-        res[f"ret_core_{h}"] = grouped[f'weighted_{h}'].sum() / w_sum
+        w_sum = grouped['core_score'].sum()
+        for h in avail_horizons:
+            res[f"ret_core_{h}"] = grouped[f'weighted_{h}'].sum() / w_sum
+            
+        top10 = grouped.head(10).groupby(group_cols)[[f"label_{h}" for h in avail_horizons]].mean()
+        top10.columns = [f"ret_top10_{h}" for h in avail_horizons]
         
-    top10 = grouped.head(10).groupby(group_cols)[[f"label_{h}" for h in avail_horizons]].mean()
-    top10.columns = [f"ret_top10_{h}" for h in avail_horizons]
-    
-    top5 = grouped.head(5).groupby(group_cols)[[f"label_{h}" for h in avail_horizons]].mean()
-    top5.columns = [f"ret_top5_{h}" for h in avail_horizons]
-    
-    theme_rets = res.join(top5).join(top10).reset_index()
-    theme_rets.to_parquet(out_file, index=False)
-    print(f"[{d}] Done! ({len(theme_rets)} rows)")
-    return True
+        top5 = grouped.head(5).groupby(group_cols)[[f"label_{h}" for h in avail_horizons]].mean()
+        top5.columns = [f"ret_top5_{h}" for h in avail_horizons]
+        
+        theme_rets = res.join(top5).join(top10).reset_index()
+        chunk_results.append(theme_rets)
+        
+    if chunk_results:
+        final_rets = pd.concat(chunk_results, ignore_index=True)
+        final_rets.to_parquet(out_file, index=False)
+        print(f"[{d}] Done! ({len(final_rets)} rows)")
+        return True
+    return False
 
 if __name__ == '__main__':
     print("Building theme returns with multiprocessing...")
-    with ProcessPoolExecutor(max_workers=3) as executor:
+    with ProcessPoolExecutor(max_workers=6) as executor:
         futures = [executor.submit(process_date, d) for d in dates]
         for fut in as_completed(futures):
             fut.result()

@@ -11,6 +11,7 @@ OUT_DIR = Path("artifacts/p2_alpha_lab")
 all_dates = [d.name.split('=')[1] for d in FLATTENED_ROOT.iterdir() if d.is_dir() and 'date=' in d.name]
 
 def process_date(d):
+    print(f"[Core-Peri] [{d}] Starting...")
     mem_path = FLATTENED_ROOT / f"date={d}" / "theme_memberships.parquet"
     lbl_path = LABELS_ROOT / f"date={d}" / "labels.parquet"
     
@@ -25,47 +26,60 @@ def process_date(d):
     df_mem['member_id'] = df_mem['member_id'].astype(int)
     df_lbl['symbol_id'] = df_lbl['symbol_id'].astype(int)
     
+    # Pre-process labels to shift past returns
     df_lbl_past = df_lbl[['decision_time', 'symbol_id', 'label_15m']].copy()
     df_lbl_past['decision_time'] = df_lbl_past['decision_time'] + pd.Timedelta(minutes=15)
     df_lbl_past = df_lbl_past.rename(columns={'label_15m': 'past_ret_15m'})
     
     df_lbl_combined = pd.merge(df_lbl, df_lbl_past, on=['decision_time', 'symbol_id'], how='inner')
-    df = pd.merge(df_mem, df_lbl_combined, left_on=['decision_time', 'member_id'], right_on=['decision_time', 'symbol_id'], how='inner')
     
-    if df.empty:
-        return None
+    chunk_results = []
+    
+    # Process by decision_time to prevent OOM
+    for dt, mem_group in df_mem.groupby('decision_time'):
+        lbl_group = df_lbl_combined[df_lbl_combined['decision_time'] == dt]
+        if lbl_group.empty: continue
+            
+        df = pd.merge(mem_group, lbl_group, left_on=["decision_time", "member_id"], right_on=["decision_time", "symbol_id"], how="inner")
+        if df.empty: continue
+            
+        group_cols = ['decision_time', 'layer_id', 'scale', 'theme_id']
+        df = df.sort_values(group_cols + ['core_score'], ascending=[True, True, True, True, False])
         
-    group_cols = ['decision_time', 'layer_id', 'scale', 'theme_id']
-    df = df.sort_values(group_cols + ['core_score'], ascending=[True, True, True, True, False])
-    
-    counts = df.groupby(group_cols).size()
-    valid_groups = counts[counts >= 5].index
-    df = df[df.set_index(group_cols).index.isin(valid_groups)]
-    
-    if df.empty:
-        return None
+        counts = df.groupby(group_cols).size()
+        valid_groups = counts[counts >= 5].index
+        if len(valid_groups) == 0: continue
+            
+        df = df[df.set_index(group_cols).index.isin(valid_groups)]
+        if df.empty: continue
+            
+        df['rank'] = df.groupby(group_cols).cumcount()
+        df['group_size'] = df.groupby(group_cols)['rank'].transform('size')
         
-    df['rank'] = df.groupby(group_cols).cumcount()
-    df['group_size'] = df.groupby(group_cols)['rank'].transform('size')
-    
-    df['is_core'] = df['rank'] < np.maximum(1, (df['group_size'] * 0.2).astype(int))
-    df['is_peri'] = df['rank'] >= (df['group_size'] - np.maximum(1, (df['group_size'] * 0.5).astype(int)))
-    
-    core_past_ret = df[df['is_core']].groupby(group_cols)['past_ret_15m'].mean().rename('core_past_ret')
-    max_core = df.groupby(group_cols)['core_score'].max().rename('max_core_score')
-    
-    peri_df = df[df['is_peri']].copy()
-    peri_df = peri_df.join(core_past_ret, on=group_cols)
-    peri_df = peri_df.join(max_core, on=group_cols)
-    
-    peri_df['peri_signal'] = peri_df['core_past_ret'] * (peri_df['max_core_score'] - peri_df['core_score'])
-    
-    res = peri_df[['decision_time', 'symbol_id', 'peri_signal', 'label_5m', 'label_15m', 'label_30m', 'label_60m']]
-    return res
+        df['is_core'] = df['rank'] < np.maximum(1, (df['group_size'] * 0.2).astype(int))
+        df['is_peri'] = df['rank'] >= (df['group_size'] - np.maximum(1, (df['group_size'] * 0.5).astype(int)))
+        
+        core_past_ret = df[df['is_core']].groupby(group_cols)['past_ret_15m'].mean().rename('core_past_ret')
+        max_core = df.groupby(group_cols)['core_score'].max().rename('max_core_score')
+        
+        peri_df = df[df['is_peri']].copy()
+        peri_df = peri_df.join(core_past_ret, on=group_cols)
+        peri_df = peri_df.join(max_core, on=group_cols)
+        
+        peri_df['peri_signal'] = peri_df['core_past_ret'] * (peri_df['max_core_score'] - peri_df['core_score'])
+        
+        res = peri_df[['decision_time', 'symbol_id', 'peri_signal', 'label_5m', 'label_15m', 'label_30m', 'label_60m']]
+        chunk_results.append(res)
+        
+    if chunk_results:
+        final_res = pd.concat(chunk_results, ignore_index=True)
+        print(f"[Core-Peri] [{d}] Done! ({len(final_res)} rows)")
+        return final_res
+    return None
 
 if __name__ == '__main__':
     all_results = []
-    with ProcessPoolExecutor(max_workers=3) as executor:
+    with ProcessPoolExecutor(max_workers=6) as executor:
         futures = [executor.submit(process_date, d) for d in all_dates]
         for fut in as_completed(futures):
             r = fut.result()
@@ -94,3 +108,4 @@ if __name__ == '__main__':
                     })
         res_df = pd.DataFrame(ic_results)
         res_df.to_csv(OUT_DIR / "core_peripheral_ic.csv", index=False)
+        print("core_peripheral_ic.csv saved!")
