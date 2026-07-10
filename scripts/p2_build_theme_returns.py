@@ -2,7 +2,6 @@ import os
 import pandas as pd
 import numpy as np
 from pathlib import Path
-from concurrent.futures import ProcessPoolExecutor, as_completed
 
 dates = [
     "2026-01-05", "2026-01-06", "2026-01-07", "2026-01-08", "2026-01-09",
@@ -18,17 +17,19 @@ OUT_DIR.mkdir(parents=True, exist_ok=True)
 horizons = ["5m", "15m", "30m", "60m", "120m"]
 
 def process_date(d):
-    print(f"[{d}] Starting...")
+    print(f"[{d}] Starting...", flush=True)
     out_file = OUT_DIR / f"date={d}.parquet"
     if out_file.exists():
-        print(f"[{d}] Already exists, skipping.")
+        print(f"[{d}] Already exists, skipping.", flush=True)
         return True
         
     mem_path = FLATTENED_ROOT / f"date={d}" / "theme_memberships.parquet"
     lbl_path = LABELS_ROOT / f"date={d}" / "labels.parquet"
     if not mem_path.exists() or not lbl_path.exists():
+        print(f"[{d}] Missing files.", flush=True)
         return False
         
+    print(f"[{d}] Loading DataFrames...", flush=True)
     df_mem = pd.read_parquet(mem_path)
     df_lbl = pd.read_parquet(lbl_path)
     
@@ -37,10 +38,16 @@ def process_date(d):
     df_mem['decision_time'] = pd.to_datetime(df_mem['decision_time'], utc=True)
     df_lbl['decision_time'] = pd.to_datetime(df_lbl['decision_time'], utc=True)
     
-    # Process by decision_time chunk to save memory
+    print(f"[{d}] Chunking by decision_time...", flush=True)
     chunk_results = []
     
-    for dt, mem_group in df_mem.groupby('decision_time'):
+    groups = df_mem.groupby('decision_time')
+    total = len(groups)
+    
+    for i, (dt, mem_group) in enumerate(groups):
+        if i % 10 == 0:
+            print(f"[{d}] Progress: {i}/{total} chunks", flush=True)
+            
         lbl_group = df_lbl[df_lbl['decision_time'] == dt]
         if lbl_group.empty:
             continue
@@ -74,17 +81,17 @@ def process_date(d):
         chunk_results.append(theme_rets)
         
     if chunk_results:
+        print(f"[{d}] Concatenating and saving...", flush=True)
         final_rets = pd.concat(chunk_results, ignore_index=True)
         final_rets.to_parquet(out_file, index=False)
-        print(f"[{d}] Done! ({len(final_rets)} rows)")
+        print(f"[{d}] Done! ({len(final_rets)} rows)", flush=True)
         return True
+    
+    print(f"[{d}] No data yielded.", flush=True)
     return False
 
 if __name__ == '__main__':
-    print("Building theme returns with multiprocessing...")
-    with ProcessPoolExecutor(max_workers=2) as executor:
-        futures = [executor.submit(process_date, d) for d in dates]
-        for fut in as_completed(futures):
-            fut.result()
-            
-    print("All dates processed.")
+    print("Building theme returns sequentially to avoid OOM...", flush=True)
+    for d in dates:
+        process_date(d)
+    print("All dates processed.", flush=True)

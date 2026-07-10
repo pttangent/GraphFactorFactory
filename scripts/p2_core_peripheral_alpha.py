@@ -2,7 +2,6 @@ import pandas as pd
 import numpy as np
 from pathlib import Path
 import scipy.stats as stats
-from concurrent.futures import ProcessPoolExecutor, as_completed
 
 FLATTENED_ROOT = Path("artifacts/p2_alpha_lab/flattened")
 LABELS_ROOT = Path(r"D:\DEV\US-Stock\GraphFactorFactory\data\graph_store_6m\canonical")
@@ -11,7 +10,7 @@ OUT_DIR = Path("artifacts/p2_alpha_lab")
 all_dates = [d.name.split('=')[1] for d in FLATTENED_ROOT.iterdir() if d.is_dir() and 'date=' in d.name]
 
 def process_date(d):
-    print(f"[Core-Peri] [{d}] Starting...")
+    print(f"[Core-Peri] [{d}] Starting...", flush=True)
     mem_path = FLATTENED_ROOT / f"date={d}" / "theme_memberships.parquet"
     lbl_path = LABELS_ROOT / f"date={d}" / "labels.parquet"
     
@@ -26,7 +25,6 @@ def process_date(d):
     df_mem['member_id'] = df_mem['member_id'].astype(int)
     df_lbl['symbol_id'] = df_lbl['symbol_id'].astype(int)
     
-    # Pre-process labels to shift past returns
     df_lbl_past = df_lbl[['decision_time', 'symbol_id', 'label_15m']].copy()
     df_lbl_past['decision_time'] = df_lbl_past['decision_time'] + pd.Timedelta(minutes=15)
     df_lbl_past = df_lbl_past.rename(columns={'label_15m': 'past_ret_15m'})
@@ -35,8 +33,8 @@ def process_date(d):
     
     chunk_results = []
     
-    # Process by decision_time to prevent OOM
-    for dt, mem_group in df_mem.groupby('decision_time'):
+    groups = df_mem.groupby('decision_time')
+    for dt, mem_group in groups:
         lbl_group = df_lbl_combined[df_lbl_combined['decision_time'] == dt]
         if lbl_group.empty: continue
             
@@ -73,18 +71,17 @@ def process_date(d):
         
     if chunk_results:
         final_res = pd.concat(chunk_results, ignore_index=True)
-        print(f"[Core-Peri] [{d}] Done! ({len(final_res)} rows)")
+        print(f"[Core-Peri] [{d}] Done! ({len(final_res)} rows)", flush=True)
         return final_res
     return None
 
 if __name__ == '__main__':
     all_results = []
-    with ProcessPoolExecutor(max_workers=2) as executor:
-        futures = [executor.submit(process_date, d) for d in all_dates]
-        for fut in as_completed(futures):
-            r = fut.result()
-            if r is not None:
-                all_results.append(r)
+    print("Running core peripheral alpha sequentially...", flush=True)
+    for d in all_dates:
+        r = process_date(d)
+        if r is not None:
+            all_results.append(r)
                 
     if all_results:
         final = pd.concat(all_results, ignore_index=True)
@@ -108,4 +105,4 @@ if __name__ == '__main__':
                     })
         res_df = pd.DataFrame(ic_results)
         res_df.to_csv(OUT_DIR / "core_peripheral_ic.csv", index=False)
-        print("core_peripheral_ic.csv saved!")
+        print("core_peripheral_ic.csv saved!", flush=True)

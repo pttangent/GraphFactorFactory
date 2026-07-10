@@ -2,78 +2,72 @@ import pandas as pd
 import numpy as np
 from pathlib import Path
 import scipy.stats as stats
-from concurrent.futures import ProcessPoolExecutor, as_completed
 
 FLATTENED_ROOT = Path("artifacts/p2_alpha_lab/flattened")
-RETURNS_DIR = Path("artifacts/p2_alpha_lab/theme_returns_by_date")
+THEME_RETS_ROOT = Path("artifacts/p2_alpha_lab/theme_returns_by_date")
 OUT_DIR = Path("artifacts/p2_alpha_lab")
 
 all_dates = [d.name.split('=')[1] for d in FLATTENED_ROOT.iterdir() if d.is_dir() and 'date=' in d.name]
 
 def process_date(d):
-    rel_path = FLATTENED_ROOT / f"date={d}" / "theme_relation_edges.parquet"
-    temp_path = FLATTENED_ROOT / f"date={d}" / "temporal_theme_edges.parquet"
-    ret_path = RETURNS_DIR / f"date={d}.parquet"
+    print(f"[Spillover] [{d}] Starting...", flush=True)
+    edges_path = FLATTENED_ROOT / f"date={d}" / "theme_relation_edges.parquet"
+    rets_path = THEME_RETS_ROOT / f"date={d}.parquet"
     
-    if not rel_path.exists() or not temp_path.exists() or not ret_path.exists():
+    if not edges_path.exists() or not rets_path.exists():
         return None
         
-    df_rel = pd.read_parquet(rel_path)
-    df_temp = pd.read_parquet(temp_path)
-    df_ret = pd.read_parquet(ret_path)
+    df_edges = pd.read_parquet(edges_path)
+    df_rets = pd.read_parquet(rets_path)
     
-    df_rel = df_rel[df_rel['hard_keep'] == False]
-    if df_rel.empty:
-        return None
+    df_edges['decision_time'] = pd.to_datetime(df_edges['decision_time'], utc=True)
+    df_rets['decision_time'] = pd.to_datetime(df_rets['decision_time'], utc=True)
+    
+    # We want past return of A predicting future return of B
+    df_rets_past = df_rets[['decision_time', 'theme_id', 'layer_id', 'scale', 'ret_eq_15m']].copy()
+    df_rets_past['decision_time'] = df_rets_past['decision_time'] + pd.Timedelta(minutes=15)
+    df_rets_past = df_rets_past.rename(columns={'ret_eq_15m': 'theme_A_past_ret_15m'})
+    
+    chunk_results = []
+    
+    for dt, edges_group in df_edges.groupby('decision_time'):
+        past_rets = df_rets_past[df_rets_past['decision_time'] == dt]
+        fut_rets = df_rets[df_rets['decision_time'] == dt]
         
-    df_rel['decision_time'] = pd.to_datetime(df_rel['decision_time'], utc=True)
-    df_temp['dst_time'] = pd.to_datetime(df_temp['dst_time'], utc=True)
-    df_ret['decision_time'] = pd.to_datetime(df_ret['decision_time'], utc=True)
-    
-    # We only have returns for current day d. A's past return means looking at A_prev at t-15m.
-    # Luckily, A_prev and A are almost always on the same day because snapshots are intraday.
-    # We can just use df_ret for the current day to look up A_prev.
-    ret_lookup = df_ret.set_index(['decision_time', 'theme_id'])['ret_core_15m'].to_dict()
-    
-    idx = df_temp.groupby(['dst_time', 'dst_theme_id'])['continuation_strength'].idxmax()
-    best_temp = df_temp.loc[idx]
-    temp_map = best_temp.set_index(['dst_time', 'dst_theme_id'])[['src_theme_id', 'src_time']]
-    
-    def get_past_return(row):
-        t_curr = row['decision_time']
-        A = row['src_theme_id']
-        key = (t_curr, A)
-        if key in temp_map.index:
-            A_prev = temp_map.loc[key, 'src_theme_id']
-            t_prev = pd.to_datetime(temp_map.loc[key, 'src_time'], utc=True)
-            return ret_lookup.get((t_prev, A_prev), np.nan)
-        return np.nan
+        if past_rets.empty or fut_rets.empty:
+            continue
+            
+        m1 = pd.merge(edges_group, past_rets, left_on=['decision_time', 'layer_id', 'scale', 'theme_A'], right_on=['decision_time', 'layer_id', 'scale', 'theme_id'], how='inner')
+        if m1.empty: continue
+            
+        m1['spillover_signal'] = m1['fuzzy_relation_score'] * m1['theme_A_past_ret_15m']
         
-    df_rel['src_past_ret_15m'] = df_rel.apply(get_past_return, axis=1)
-    df_rel = df_rel.dropna(subset=['src_past_ret_15m'])
-    df_rel['spillover_signal'] = df_rel['relation_strength'] * df_rel['src_past_ret_15m']
-    
-    signal_df = df_rel.groupby(['decision_time', 'dst_theme_id'])['spillover_signal'].sum().reset_index()
-    signal_df = signal_df.rename(columns={'dst_theme_id': 'theme_id'})
-    
-    merged = pd.merge(signal_df, df_ret, on=['decision_time', 'theme_id'], how='inner')
-    return merged
+        agg = m1.groupby(['decision_time', 'layer_id', 'scale', 'theme_B'])['spillover_signal'].mean().reset_index()
+        
+        m2 = pd.merge(agg, fut_rets, left_on=['decision_time', 'layer_id', 'scale', 'theme_B'], right_on=['decision_time', 'layer_id', 'scale', 'theme_id'], how='inner')
+        if not m2.empty:
+            chunk_results.append(m2)
+            
+    if chunk_results:
+        final_res = pd.concat(chunk_results, ignore_index=True)
+        print(f"[Spillover] [{d}] Done! ({len(final_res)} rows)", flush=True)
+        return final_res
+    return None
 
 if __name__ == '__main__':
     all_results = []
-    with ProcessPoolExecutor(max_workers=3) as executor:
-        futures = [executor.submit(process_date, d) for d in all_dates]
-        for fut in as_completed(futures):
-            r = fut.result()
-            if r is not None:
-                all_results.append(r)
-                
+    print("Running spillover alpha sequentially...", flush=True)
+    for d in all_dates:
+        r = process_date(d)
+        if r is not None:
+            all_results.append(r)
+            
     if all_results:
         final = pd.concat(all_results, ignore_index=True)
         horizons = ["5m", "15m", "30m", "60m"]
         ic_results = []
         for h in horizons:
-            col = f"ret_core_{h}"
+            col = f"ret_eq_{h}"
             if col in final.columns:
                 valid = final.dropna(subset=['spillover_signal', col])
                 if not valid.empty:
@@ -90,3 +84,4 @@ if __name__ == '__main__':
                     })
         res_df = pd.DataFrame(ic_results)
         res_df.to_csv(OUT_DIR / "relation_spillover_ic.csv", index=False)
+        print("relation_spillover_ic.csv saved!", flush=True)
