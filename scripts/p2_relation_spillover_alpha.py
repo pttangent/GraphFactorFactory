@@ -5,30 +5,35 @@ import scipy.stats as stats
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 FLATTENED_ROOT = Path("artifacts/p2_alpha_lab/flattened")
-RETURNS_PATH = Path("artifacts/p2_alpha_lab/theme_returns.parquet")
+RETURNS_DIR = Path("artifacts/p2_alpha_lab/theme_returns_by_date")
 OUT_DIR = Path("artifacts/p2_alpha_lab")
-
-print("Loading theme returns...")
-df_ret = pd.read_parquet(RETURNS_PATH)
-df_ret['decision_time'] = pd.to_datetime(df_ret['decision_time'], utc=True)
-ret_lookup = df_ret.set_index(['decision_time', 'theme_id'])['ret_core_15m'].to_dict()
 
 all_dates = [d.name.split('=')[1] for d in FLATTENED_ROOT.iterdir() if d.is_dir() and 'date=' in d.name]
 
 def process_date(d):
     rel_path = FLATTENED_ROOT / f"date={d}" / "theme_relation_edges.parquet"
     temp_path = FLATTENED_ROOT / f"date={d}" / "temporal_theme_edges.parquet"
-    if not rel_path.exists() or not temp_path.exists():
+    ret_path = RETURNS_DIR / f"date={d}.parquet"
+    
+    if not rel_path.exists() or not temp_path.exists() or not ret_path.exists():
         return None
         
     df_rel = pd.read_parquet(rel_path)
     df_temp = pd.read_parquet(temp_path)
+    df_ret = pd.read_parquet(ret_path)
+    
     df_rel = df_rel[df_rel['hard_keep'] == False]
     if df_rel.empty:
         return None
         
     df_rel['decision_time'] = pd.to_datetime(df_rel['decision_time'], utc=True)
     df_temp['dst_time'] = pd.to_datetime(df_temp['dst_time'], utc=True)
+    df_ret['decision_time'] = pd.to_datetime(df_ret['decision_time'], utc=True)
+    
+    # We only have returns for current day d. A's past return means looking at A_prev at t-15m.
+    # Luckily, A_prev and A are almost always on the same day because snapshots are intraday.
+    # We can just use df_ret for the current day to look up A_prev.
+    ret_lookup = df_ret.set_index(['decision_time', 'theme_id'])['ret_core_15m'].to_dict()
     
     idx = df_temp.groupby(['dst_time', 'dst_theme_id'])['continuation_strength'].idxmax()
     best_temp = df_temp.loc[idx]
@@ -51,13 +56,12 @@ def process_date(d):
     signal_df = df_rel.groupby(['decision_time', 'dst_theme_id'])['spillover_signal'].sum().reset_index()
     signal_df = signal_df.rename(columns={'dst_theme_id': 'theme_id'})
     
-    day_ret = df_ret[df_ret['decision_time'].dt.strftime('%Y-%m-%d') == d]
-    merged = pd.merge(signal_df, day_ret, on=['decision_time', 'theme_id'], how='inner')
+    merged = pd.merge(signal_df, df_ret, on=['decision_time', 'theme_id'], how='inner')
     return merged
 
 if __name__ == '__main__':
     all_results = []
-    with ProcessPoolExecutor(max_workers=8) as executor:
+    with ProcessPoolExecutor(max_workers=3) as executor:
         futures = [executor.submit(process_date, d) for d in all_dates]
         for fut in as_completed(futures):
             r = fut.result()

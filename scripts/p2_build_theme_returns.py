@@ -13,15 +13,21 @@ dates = [
 
 FLATTENED_ROOT = Path("artifacts/p2_alpha_lab/flattened")
 LABELS_ROOT = Path(r"D:\DEV\US-Stock\GraphFactorFactory\data\graph_store_6m\canonical")
-OUT_DIR = Path("artifacts/p2_alpha_lab")
+OUT_DIR = Path("artifacts/p2_alpha_lab/theme_returns_by_date")
+OUT_DIR.mkdir(parents=True, exist_ok=True)
 horizons = ["5m", "15m", "30m", "60m", "120m"]
 
 def process_date(d):
     print(f"[{d}] Starting...")
+    out_file = OUT_DIR / f"date={d}.parquet"
+    if out_file.exists():
+        print(f"[{d}] Already exists, skipping.")
+        return True
+        
     mem_path = FLATTENED_ROOT / f"date={d}" / "theme_memberships.parquet"
     lbl_path = LABELS_ROOT / f"date={d}" / "labels.parquet"
     if not mem_path.exists() or not lbl_path.exists():
-        return None
+        return False
         
     df_mem = pd.read_parquet(mem_path)
     df_lbl = pd.read_parquet(lbl_path)
@@ -33,7 +39,7 @@ def process_date(d):
     
     df = pd.merge(df_mem, df_lbl, left_on=["decision_time", "member_id"], right_on=["decision_time", "symbol_id"], how="inner")
     
-    if df.empty: return None
+    if df.empty: return False
         
     group_cols = ["decision_time", "layer_id", "scale", "level", "theme_id"]
     df = df.sort_values("core_score", ascending=False)
@@ -57,24 +63,15 @@ def process_date(d):
     top5.columns = [f"ret_top5_{h}" for h in avail_horizons]
     
     theme_rets = res.join(top5).join(top10).reset_index()
+    theme_rets.to_parquet(out_file, index=False)
     print(f"[{d}] Done! ({len(theme_rets)} rows)")
-    return theme_rets
+    return True
 
 if __name__ == '__main__':
     print("Building theme returns with multiprocessing...")
-    all_theme_returns = []
-    # 8 workers guarantees no OOM with 37GB free RAM (~4GB per worker budget), 
-    # and numpy/pandas multithreading will easily push CPU > 80% across 24 cores.
-    with ProcessPoolExecutor(max_workers=8) as executor:
+    with ProcessPoolExecutor(max_workers=3) as executor:
         futures = [executor.submit(process_date, d) for d in dates]
         for fut in as_completed(futures):
-            r = fut.result()
-            if r is not None:
-                all_theme_returns.append(r)
-                
-    if all_theme_returns:
-        final_df = pd.concat(all_theme_returns, ignore_index=True)
-        final_df.to_parquet(OUT_DIR / "theme_returns.parquet", index=False)
-        print(f"Successfully saved theme_returns.parquet with {len(final_df)} rows.")
-    else:
-        print("No data processed.")
+            fut.result()
+            
+    print("All dates processed.")

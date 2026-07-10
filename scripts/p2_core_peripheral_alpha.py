@@ -65,7 +65,7 @@ def process_date(d):
 
 if __name__ == '__main__':
     all_results = []
-    with ProcessPoolExecutor(max_workers=8) as executor:
+    with ProcessPoolExecutor(max_workers=3) as executor:
         futures = [executor.submit(process_date, d) for d in all_dates]
         for fut in as_completed(futures):
             r = fut.result()

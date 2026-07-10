@@ -5,31 +5,30 @@ import scipy.stats as stats
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 FLATTENED_ROOT = Path("artifacts/p2_alpha_lab/flattened")
-RETURNS_PATH = Path("artifacts/p2_alpha_lab/theme_returns.parquet")
+RETURNS_DIR = Path("artifacts/p2_alpha_lab/theme_returns_by_date")
 OUT_DIR = Path("artifacts/p2_alpha_lab")
-
-print("Loading theme returns...")
-df_ret = pd.read_parquet(RETURNS_PATH)
-df_ret['decision_time'] = pd.to_datetime(df_ret['decision_time'], utc=True)
 
 all_dates = [d.name.split('=')[1] for d in FLATTENED_ROOT.iterdir() if d.is_dir() and 'date=' in d.name]
 
 def process_date(d):
     temp_path = FLATTENED_ROOT / f"date={d}" / "temporal_theme_edges.parquet"
-    if not temp_path.exists():
+    ret_path = RETURNS_DIR / f"date={d}.parquet"
+    if not temp_path.exists() or not ret_path.exists():
         return None
         
     df_temp = pd.read_parquet(temp_path)
     df_temp['dst_time'] = pd.to_datetime(df_temp['dst_time'], utc=True)
     has_predecessor = set(zip(df_temp['dst_time'], df_temp['dst_theme_id']))
     
-    day_ret = df_ret[df_ret['decision_time'].dt.strftime('%Y-%m-%d') == d].copy()
-    day_ret['is_new_theme'] = day_ret.apply(lambda r: 0 if (r['decision_time'], r['theme_id']) in has_predecessor else 1, axis=1)
-    return day_ret
+    df_ret = pd.read_parquet(ret_path)
+    df_ret['decision_time'] = pd.to_datetime(df_ret['decision_time'], utc=True)
+    
+    df_ret['is_new_theme'] = df_ret.apply(lambda r: 0 if (r['decision_time'], r['theme_id']) in has_predecessor else 1, axis=1)
+    return df_ret
 
 if __name__ == '__main__':
     all_results = []
-    with ProcessPoolExecutor(max_workers=8) as executor:
+    with ProcessPoolExecutor(max_workers=3) as executor:
         futures = [executor.submit(process_date, d) for d in all_dates]
         for fut in as_completed(futures):
             r = fut.result()
