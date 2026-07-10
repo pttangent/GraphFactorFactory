@@ -82,7 +82,7 @@ def process_date(d):
 
 if __name__ == '__main__':
     print("Building theme returns with multiprocessing...")
-    with ProcessPoolExecutor(max_workers=6) as executor:
+    with ProcessPoolExecutor(max_workers=2) as executor:
         futures = [executor.submit(process_date, d) for d in dates]
         for fut in as_completed(futures):
             fut.result()
