@@ -39,40 +39,42 @@ for d in dates:
     df_mem['decision_time'] = pd.to_datetime(df_mem['decision_time'], utc=True)
     df_lbl['decision_time'] = pd.to_datetime(df_lbl['decision_time'], utc=True)
     
-    # We also need to match on decision_time. P1 memberships should have decision_time.
     df = pd.merge(df_mem, df_lbl, left_on=["decision_time", "member_id"], right_on=["decision_time", "symbol_id"], how="inner")
     
     if df.empty:
         print(f"  No overlapping labels for {d}.")
         continue
         
-    # We want to group by: decision_time, layer_id, scale, level, theme_id
     group_cols = ["decision_time", "layer_id", "scale", "level", "theme_id"]
     
-    # Pre-sort by core_score descending to easily get top 5 / top 10
+    # Pre-sort by core_score descending
     df = df.sort_values("core_score", ascending=False)
     
-    def agg_theme(g):
-        res = {}
-        for h in horizons:
-            col = f"label_{h}"
-            if col not in g.columns:
-                continue
-            
-            vals = g[col]
-            weights = g["core_score"]
-            # Equal weight
-            res[f"ret_eq_{h}"] = vals.mean()
-            # Core weighted
-            w_sum = weights.sum()
-            res[f"ret_core_{h}"] = (vals * weights).sum() / w_sum if w_sum > 0 else np.nan
-            # Top 5 core equal weight
-            res[f"ret_top5_{h}"] = vals.head(5).mean()
-            # Top 10 core equal weight
-            res[f"ret_top10_{h}"] = vals.head(10).mean()
-        return pd.Series(res)
-
-    theme_rets = df.groupby(group_cols).apply(agg_theme).reset_index()
+    # Vectorized computation
+    avail_horizons = [h for h in horizons if f"label_{h}" in df.columns]
+    
+    for h in avail_horizons:
+        df[f'weighted_{h}'] = df[f'label_{h}'] * df['core_score']
+        
+    grouped = df.groupby(group_cols)
+    
+    # Equal weight
+    res = grouped[[f"label_{h}" for h in avail_horizons]].mean()
+    res.columns = [f"ret_eq_{h}" for h in avail_horizons]
+    
+    # Core weighted
+    w_sum = grouped['core_score'].sum()
+    for h in avail_horizons:
+        res[f"ret_core_{h}"] = grouped[f'weighted_{h}'].sum() / w_sum
+        
+    # Top 5 and Top 10
+    top10 = grouped.head(10).groupby(group_cols)[[f"label_{h}" for h in avail_horizons]].mean()
+    top10.columns = [f"ret_top10_{h}" for h in avail_horizons]
+    
+    top5 = grouped.head(5).groupby(group_cols)[[f"label_{h}" for h in avail_horizons]].mean()
+    top5.columns = [f"ret_top5_{h}" for h in avail_horizons]
+    
+    theme_rets = res.join(top5).join(top10).reset_index()
     all_theme_returns.append(theme_rets)
     print(f"  Generated {len(theme_rets)} theme return records.")
 
