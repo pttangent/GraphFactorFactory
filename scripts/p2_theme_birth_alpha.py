@@ -2,6 +2,8 @@ import pandas as pd
 import numpy as np
 from pathlib import Path
 import scipy.stats as stats
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing
 
 FLATTENED_ROOT = Path("artifacts/p2_alpha_lab/flattened")
 THEME_RETS_ROOT = Path("artifacts/p2_alpha_lab/theme_returns_by_date")
@@ -10,58 +12,77 @@ OUT_DIR = Path("artifacts/p2_alpha_lab")
 all_dates = [d.name.split('=')[1] for d in FLATTENED_ROOT.iterdir() if d.is_dir() and 'date=' in d.name]
 all_dates.sort()
 
-seen_themes = set()
-
-def process_date(d):
-    global seen_themes
-    print(f"[Birth] [{d}] Starting...", flush=True)
-    nodes_path = FLATTENED_ROOT / f"date={d}" / "theme_nodes.parquet"
-    rets_path = THEME_RETS_ROOT / f"date={d}.parquet"
-    
-    if not nodes_path.exists() or not rets_path.exists():
-        return None
+def process_date(d, load_lock):
+    try:
+        nodes_path = FLATTENED_ROOT / f"date={d}" / "theme_nodes.parquet"
+        rets_path = THEME_RETS_ROOT / f"date={d}.parquet"
         
-    df_nodes = pd.read_parquet(nodes_path)
-    df_rets = pd.read_parquet(rets_path)
-    
-    df_nodes['decision_time'] = pd.to_datetime(df_nodes['decision_time'], utc=True)
-    df_rets['decision_time'] = pd.to_datetime(df_rets['decision_time'], utc=True)
-    
-    df_nodes['theme_id_full'] = df_nodes['layer_id'].astype(str) + "_" + df_nodes['scale'].astype(str) + "_" + df_nodes['theme_id'].astype(str)
-    
-    chunk_results = []
-    
-    for dt, nodes_group in df_nodes.groupby('decision_time'):
-        current_themes = set(nodes_group['theme_id_full'])
-        new_themes = current_themes - seen_themes
-        seen_themes.update(current_themes)
+        if not nodes_path.exists() or not rets_path.exists():
+            return None, set()
+            
+        with load_lock:
+            df_nodes = pd.read_parquet(nodes_path)
+            df_rets = pd.read_parquet(rets_path)
+            
+            df_nodes['decision_time'] = pd.to_datetime(df_nodes['decision_time'], utc=True)
+            df_rets['decision_time'] = pd.to_datetime(df_rets['decision_time'], utc=True)
+            
+        df_nodes['theme_id_full'] = df_nodes['layer_id'].astype(str) + "_" + df_nodes['scale'].astype(str) + "_" + df_nodes['theme_id'].astype(str)
         
-        if not new_themes:
-            continue
-            
-        nodes_group = nodes_group[nodes_group['theme_id_full'].isin(new_themes)].copy()
-        nodes_group['is_new'] = 1.0
+        chunk_results = []
+        all_themes_in_day = set()
         
-        fut_rets = df_rets[df_rets['decision_time'] == dt]
-        if fut_rets.empty: continue
+        for dt, nodes_group in df_nodes.groupby('decision_time'):
+            current_themes = set(nodes_group['theme_id_full'])
+            all_themes_in_day.update(current_themes)
             
-        m = pd.merge(nodes_group, fut_rets, on=['decision_time', 'layer_id', 'scale', 'theme_id'], how='inner')
-        if not m.empty:
-            chunk_results.append(m[['decision_time', 'layer_id', 'scale', 'theme_id', 'is_new', 'ret_eq_5m', 'ret_eq_15m', 'ret_eq_30m', 'ret_eq_60m']])
-            
-    if chunk_results:
-        final_res = pd.concat(chunk_results, ignore_index=True)
-        print(f"[Birth] [{d}] Done! ({len(final_res)} rows)", flush=True)
-        return final_res
-    return None
+            fut_rets = df_rets[df_rets['decision_time'] == dt]
+            if fut_rets.empty: continue
+                
+            m = pd.merge(nodes_group, fut_rets, on=['decision_time', 'layer_id', 'scale', 'theme_id'], how='inner')
+            if not m.empty:
+                chunk_results.append(m[['decision_time', 'layer_id', 'scale', 'theme_id', 'theme_id_full', 'ret_eq_5m', 'ret_eq_15m', 'ret_eq_30m', 'ret_eq_60m']])
+                
+        if chunk_results:
+            final_res = pd.concat(chunk_results, ignore_index=True)
+            return final_res, all_themes_in_day
+        return None, all_themes_in_day
+    except Exception as e:
+        print(f"[{d}] ERROR: {str(e)}", flush=True)
+        return None, set()
 
 if __name__ == '__main__':
     all_results = []
-    print("Running theme birth alpha sequentially...", flush=True)
+    seen_themes = set()
+    
+    print("Running theme birth alpha concurrently with Lock...", flush=True)
+    m = multiprocessing.Manager()
+    load_lock = m.Lock()
+    
+    # We must process dates chronologically to correctly identify 'new' themes.
+    # We can't fully parallelize the 'seen' logic easily, so we parallelize loading/merging
+    # and then filter sequentially.
+    
+    with ProcessPoolExecutor(max_workers=6) as executor:
+        futures = {executor.submit(process_date, d, load_lock): d for d in all_dates}
+        
+        date_results = {}
+        for future in as_completed(futures):
+            d = futures[future]
+            res, day_themes = future.result()
+            date_results[d] = (res, day_themes)
+            print(f"[Birth] [{d}] Loaded.", flush=True)
+            
+    # Now sequentially identify birth
     for d in all_dates:
-        r = process_date(d)
-        if r is not None:
-            all_results.append(r)
+        if d not in date_results: continue
+        res, day_themes = date_results[d]
+        if res is not None:
+            res['is_new'] = ~res['theme_id_full'].isin(seen_themes)
+            new_res = res[res['is_new']].copy()
+            if not new_res.empty:
+                all_results.append(new_res)
+        seen_themes.update(day_themes)
             
     if all_results:
         final = pd.concat(all_results, ignore_index=True)
