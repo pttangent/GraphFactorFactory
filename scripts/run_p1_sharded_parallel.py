@@ -44,7 +44,7 @@ def run_one(
     shard_root: Path,
     out_root: Path,
     output_format: str,
-    max_groups: int | None,
+    max_snapshots: int | None,
     skip_existing: bool,
 ) -> dict:
     out_dir = output_dir_for(shard, shard_root, out_root)
@@ -53,20 +53,18 @@ def run_one(
         return {"status": "skipped", "shard": str(shard), "out_dir": str(out_dir)}
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # The existing production builder accepts a single parquet path.  Once P0 is
-    # physically sharded, the builder no longer reads a whole dense date.
     cmd = [
         sys.executable,
         str(builder),
-        "--p0-edges",
+        "--p0-edges-shard",
         str(shard),
         "--out-dir",
         str(out_dir),
         "--output-format",
         output_format,
     ]
-    if max_groups is not None:
-        cmd += ["--max-groups", str(max_groups)]
+    if max_snapshots is not None:
+        cmd += ["--max-snapshots", str(max_snapshots)]
 
     env = os.environ.copy()
     env.setdefault("PYTHONUNBUFFERED", "1")
@@ -82,13 +80,13 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Run B50/B35 P1 at date/layer/scale shard granularity.")
     ap.add_argument("--shard-root", required=True)
     ap.add_argument("--out-root", required=True)
-    ap.add_argument("--builder", default="scripts/build_b50_b35_theme_forest.py")
+    ap.add_argument("--builder", default="scripts/build_b50_b35_theme_forest_streaming.py")
     ap.add_argument("--workers", type=int, default=6)
     ap.add_argument("--dates", default=None)
     ap.add_argument("--layers", default=None)
     ap.add_argument("--scales", default=None)
     ap.add_argument("--max-shards", type=int, default=None)
-    ap.add_argument("--max-groups", type=int, default=None, help="Smoke-test cap passed to each shard builder")
+    ap.add_argument("--max-snapshots", type=int, default=None, help="Smoke-test cap passed to each shard builder")
     ap.add_argument("--output-format", choices=["parquet", "csv"], default="parquet")
     ap.add_argument("--skip-existing", action="store_true")
     args = ap.parse_args()
@@ -107,7 +105,7 @@ def main() -> None:
     results: list[dict] = []
     with cf.ThreadPoolExecutor(max_workers=args.workers) as ex:
         futs = [
-            ex.submit(run_one, builder, s, shard_root, out_root, args.output_format, args.max_groups, args.skip_existing)
+            ex.submit(run_one, builder, s, shard_root, out_root, args.output_format, args.max_snapshots, args.skip_existing)
             for s in shards
         ]
         for fut in cf.as_completed(futs):
