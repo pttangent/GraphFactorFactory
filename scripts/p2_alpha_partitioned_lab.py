@@ -12,7 +12,7 @@ class Part:
     date:str; layer_id:str; scale:str; base:Path
 
 def csvset(s): return None if not s else {x.strip() for x in s.split(',') if x.strip()}
-def csvlist(s): return None if not s else [x.strip() for x in s.split(',') if x.strip()}
+def csvlist(s): return None if not s else [x.strip() for x in s.split(',') if x.strip()]
 def ext(p,k):
     for x in p.parts:
         if x.startswith(k+'='): return x.split('=',1)[1]
