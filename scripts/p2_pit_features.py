@@ -124,7 +124,52 @@ def build_intraday_feature_frame(frame: pd.DataFrame, underreaction_past_horizon
     return result
 
 
-def build_daily_feature_frame(frame: pd.DataFrame, underreaction_past_horizon: str, late_minutes: int) -> pd.DataFrame:
+def build_temporal_episode_map(theme_ids: pd.Series, temporal_edges: pd.DataFrame) -> pd.DataFrame:
+    """Map snapshot-local theme IDs to full-session temporal episodes."""
+    nodes = {str(value) for value in theme_ids.dropna().astype(str)}
+    parent = {node: node for node in nodes}
+
+    def find(node: str) -> str:
+        parent.setdefault(node, node)
+        while parent[node] != node:
+            parent[node] = parent[parent[node]]
+            node = parent[node]
+        return node
+
+    def union(left: str, right: str) -> None:
+        a, b = find(left), find(right)
+        if a == b:
+            return
+        parent[max(a, b)] = min(a, b)
+
+    if temporal_edges is not None and not temporal_edges.empty:
+        required = {"src_theme_id", "dst_theme_id"}
+        if missing := required - set(temporal_edges):
+            raise ValueError(f"temporal theme edges missing {sorted(missing)}")
+        for left, right in temporal_edges[["src_theme_id", "dst_theme_id"]].dropna().astype(str).itertuples(index=False, name=None):
+            nodes.update((left, right))
+            parent.setdefault(left, left)
+            parent.setdefault(right, right)
+            union(left, right)
+
+    components: dict[str, list[str]] = {}
+    for node in nodes:
+        components.setdefault(find(node), []).append(node)
+    episode_for: dict[str, str] = {}
+    for members in components.values():
+        ordered = sorted(members, key=lambda value: (parse_theme_ts_series(pd.Series([value])).iloc[0], value))
+        episode_id = "episode|" + ordered[0]
+        for member in members:
+            episode_for[member] = episode_id
+    return pd.DataFrame({"dst_theme_id": list(episode_for), "theme_episode_id": list(episode_for.values())})
+
+
+def build_daily_feature_frame(
+    frame: pd.DataFrame,
+    underreaction_past_horizon: str,
+    late_minutes: int,
+    temporal_edges: pd.DataFrame | None = None,
+) -> pd.DataFrame:
     unsafe_input_targets = [c for c in frame if re.fullmatch(r"target_\d+d", c)]
     if unsafe_input_targets:
         raise ValueError(f"daily EOD features reject close-start labels: {unsafe_input_targets}")
@@ -132,38 +177,53 @@ def build_daily_feature_frame(frame: pd.DataFrame, underreaction_past_horizon: s
     frame["decision_time"] = pd.to_datetime(frame["decision_time"], utc=True, errors="coerce")
     if "date" not in frame:
         frame["date"] = frame["decision_time"].dt.strftime("%Y-%m-%d")
-    frame["target_path_id"] = canonical_theme_path(frame["dst_theme_id"])
-    session_close = frame.groupby(["date", "layer_id", "scale"], sort=False)["decision_time"].transform("max")
-    late = frame["decision_time"] >= (session_close - pd.Timedelta(minutes=late_minutes))
+
+    if "theme_episode_id" not in frame:
+        if temporal_edges is None:
+            raise ValueError("daily EOD features require temporal_theme_edges or a precomputed theme_episode_id")
+        mapping = build_temporal_episode_map(frame["dst_theme_id"], temporal_edges)
+        frame = frame.merge(mapping, on="dst_theme_id", how="left", validate="many_to_one")
+    if frame["theme_episode_id"].isna().any():
+        raise ValueError("daily episode mapping left unmapped theme IDs")
+
+    session_keys = ["date", "layer_id", "scale"]
+    frame["session_close"] = frame.groupby(session_keys, sort=False)["decision_time"].transform("max")
+    late = frame["decision_time"] >= (frame["session_close"] - pd.Timedelta(minutes=late_minutes))
     frame["late_signal"] = frame["signal_sum"].where(late, 0.0)
     frame["late_abs_signal"] = frame["absolute_signal_sum"].where(late, 0.0)
 
-    group_columns = ["date", "layer_id", "scale", "level", "target_path_id"]
-    aggregations: dict[str, str] = {
-        "decision_time": "max",
-        "signal_sum": "sum",
-        "absolute_signal_sum": "sum",
-        "positive_signal_sum": "sum",
-        "negative_signal_sum": "sum",
-        "positive_source_count": "sum",
-        "negative_source_count": "sum",
-        "relation_edge_count": "sum",
-        "relation_strength_mean": "mean",
-        "late_signal": "sum",
-        "late_abs_signal": "sum",
-    }
-    for column in frame.columns:
-        if column.startswith("target_") and any(column == f"target_{h}" for h in DEFAULT_DAILY_HORIZONS):
-            aggregations[column] = "mean"
-        elif column.startswith("target_entry_date_") or column.startswith("target_exit_date_"):
-            aggregations[column] = "max"
-        elif column.startswith("dst_past_eq_"):
-            aggregations[column] = "mean"
+    group_columns = ["date", "layer_id", "scale", "level", "theme_episode_id"]
     grouped = frame.groupby(group_columns, sort=False, dropna=False)
-    result = grouped.agg(aggregations).reset_index()
-    first_times = grouped["decision_time"].min().reset_index(name="first_time")
-    result = result.rename(columns={"decision_time": "feature_time"}).merge(first_times, on=group_columns, how="left", validate="one_to_one")
-    result["last_time"] = result["feature_time"]
+    result = grouped.agg(
+        first_time=("decision_time", "min"),
+        last_time=("decision_time", "max"),
+        session_close=("session_close", "max"),
+        signal_sum=("signal_sum", "sum"),
+        absolute_signal_sum=("absolute_signal_sum", "sum"),
+        positive_signal_sum=("positive_signal_sum", "sum"),
+        negative_signal_sum=("negative_signal_sum", "sum"),
+        positive_source_count=("positive_source_count", "sum"),
+        negative_source_count=("negative_source_count", "sum"),
+        relation_edge_count=("relation_edge_count", "sum"),
+        relation_strength_mean=("relation_strength_mean", "mean"),
+        late_signal=("late_signal", "sum"),
+        late_abs_signal=("late_abs_signal", "sum"),
+    ).reset_index()
+
+    result = result.loc[result["last_time"].eq(result["session_close"])].copy()
+    if result.empty:
+        return result
+    final_rows = frame.loc[frame["decision_time"].eq(frame["session_close"])].copy()
+    final_rows = final_rows.sort_values("decision_time").drop_duplicates(group_columns, keep="last")
+    final_columns = group_columns.copy()
+    for column in frame:
+        if column.startswith("target_") or column.startswith("dst_past_eq_") or column.startswith("dst_past_available_time_"):
+            final_columns.append(column)
+    final_columns = list(dict.fromkeys(final_columns))
+    result = result.merge(final_rows[final_columns], on=group_columns, how="left", validate="one_to_one")
+
+    result["target_path_id"] = result["theme_episode_id"]
+    result["feature_time"] = result["session_close"]
     result["observation_count"] = result["relation_edge_count"]
     result["daily_pressure"] = result["signal_sum"]
     result["absolute_pressure"] = result["absolute_signal_sum"]
@@ -193,7 +253,7 @@ def build_daily_feature_frame(frame: pd.DataFrame, underreaction_past_horizon: s
         result["target_pre_response_z"] = zscore_by_group(result, daily_columns, preferred_past)
         result["underreaction_gap_z"] = result["expected_pressure_z"] - result["target_pre_response_z"]
         result["daily_underreaction_score"] = result["underreaction_gap_z"] * (1.0 + result["late_absolute_share"].fillna(0.0))
-        result["daily_underreaction_status"] = "pit_eod_known_past_response"
+        result["daily_underreaction_status"] = "pit_eod_final_snapshot_response"
     else:
         result["expected_pressure_z"] = np.nan
         result["target_pre_response_z"] = np.nan
@@ -201,8 +261,23 @@ def build_daily_feature_frame(frame: pd.DataFrame, underreaction_past_horizon: s
         result["daily_underreaction_score"] = np.nan
         result["daily_underreaction_status"] = f"missing_{preferred_past}"
 
-    result["feature_contract"] = "end_of_day_next_open_execution"
-    result["pit_audit_pass"] = True
+    audit = result["feature_time"].eq(result["session_close"])
+    feature_date = pd.to_datetime(result["date"], errors="coerce").dt.date
+    for horizon in DEFAULT_DAILY_HORIZONS:
+        target = f"target_{horizon}"
+        if target not in result:
+            continue
+        entry = f"target_entry_date_{horizon}"
+        exit_column = f"target_exit_date_{horizon}"
+        if entry not in result or exit_column not in result:
+            audit &= False
+            continue
+        entry_date = pd.to_datetime(result[entry], errors="coerce").dt.date
+        exit_date = pd.to_datetime(result[exit_column], errors="coerce").dt.date
+        present = result[target].notna()
+        audit &= ~present | ((entry_date > feature_date) & (exit_date >= entry_date))
+    result["feature_contract"] = "end_of_day_episode_next_open_execution"
+    result["pit_audit_pass"] = audit
     return result
 
 
@@ -214,6 +289,7 @@ def _build_feature_one(
     late_minutes: int,
     skip_existing: bool,
     max_row_groups: int | None,
+    temporal_root: str | Path | None = None,
 ) -> dict:
     started = time.time()
     output_dir = Path(output_root) / f"date={part.date}" / f"layer_id={part.layer_id}" / f"scale={part.scale}"
@@ -225,7 +301,18 @@ def _build_feature_one(
     if frame.empty:
         output_rows = 0
     else:
-        output = build_intraday_feature_frame(frame, underreaction_past_horizon) if mode == "intraday" else build_daily_feature_frame(frame, underreaction_past_horizon, late_minutes)
+        if mode == "intraday":
+            output = build_intraday_feature_frame(frame, underreaction_past_horizon)
+        else:
+            if temporal_root is None:
+                raise ValueError("daily mode requires --p1-root with temporal_theme_edges.parquet")
+            temporal_path = Path(temporal_root) / f"date={part.date}" / f"layer_id={part.layer_id}" / f"scale={part.scale}" / "temporal_theme_edges.parquet"
+            if not temporal_path.exists():
+                raise FileNotFoundError(f"missing daily temporal identity file: {temporal_path}")
+            temporal = read_partition(temporal_path, None, max_row_groups)
+            if "level" in temporal:
+                temporal = temporal[temporal["level"].astype(str).isin(frame["level"].astype(str).unique())]
+            output = build_daily_feature_frame(frame, underreaction_past_horizon, late_minutes, temporal)
         if not bool(output["pit_audit_pass"].all()):
             failed = int((~output["pit_audit_pass"]).sum())
             raise AssertionError(f"{failed} {mode} feature rows failed PIT audit")
@@ -257,7 +344,11 @@ def _metric_row(subset: pd.DataFrame, score: str, target: str, keys: tuple, key_
     top = values.loc[values[score] >= q80, target].mean()
     bottom = values.loc[values[score] <= q20, target].mean()
     row = dict(zip(key_names, keys))
-    rank_ic = np.nan if values[score].nunique(dropna=True) < 2 or values[target].nunique(dropna=True) < 2 else values[score].rank().corr(values[target].rank())
+    rank_ic = (
+        np.nan
+        if values[score].nunique(dropna=True) < 2 or values[target].nunique(dropna=True) < 2
+        else values[score].rank().corr(values[target].rank())
+    )
     row.update({"score": score, "target": target, "sample_count": len(values), "rank_ic": rank_ic, "top_minus_bottom": top - bottom})
     return row
 
