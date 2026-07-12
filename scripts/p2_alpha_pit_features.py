@@ -67,6 +67,7 @@ def main() -> None:
         common(feature_parser)
         feature_parser.add_argument("--signals-root", required=True)
         feature_parser.add_argument("--out-root", required=True)
+        feature_parser.add_argument("--p1-root")
         feature_parser.add_argument("--late-minutes", type=int, default=60)
         feature_parser.add_argument("--underreaction-past-horizon", default="15m")
 
@@ -93,7 +94,9 @@ def main() -> None:
     elif args.command in {"intraday-relation-features", "daily-relation-features"}:
         mode = "intraday" if args.command.startswith("intraday") else "daily"
         parts = discover(args.signals_root, "relation_spillover_signals.parquet", dates, layers, scales)
-        results = pool(parts, args.workers, _build_feature_one, args.out_root, mode, args.underreaction_past_horizon, args.late_minutes, args.skip_existing, args.max_row_groups)
+        if mode == "daily" and not args.p1_root:
+            raise SystemExit("daily-relation-features requires --p1-root for temporal episode identity")
+        results = pool(parts, args.workers, _build_feature_one, args.out_root, mode, args.underreaction_past_horizon, args.late_minutes, args.skip_existing, args.max_row_groups, args.p1_root)
         save_run_summary(args.out_root, results)
     elif args.command == "evaluate-intraday":
         results = evaluate_feature_root(args.features_root, args.out_dir, "intraday")
