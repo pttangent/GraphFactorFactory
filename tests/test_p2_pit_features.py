@@ -90,11 +90,16 @@ def test_symmetric_relation_expansion_has_both_directions():
 def test_daily_full_session_aggregation_accepts_only_next_open_targets():
     t1 = pd.Timestamp("2026-01-05 15:00", tz="UTC")
     t2 = pd.Timestamp("2026-01-05 21:00", tz="UTC")
-    frame = pd.concat([_signal_rows(t1, list(np.linspace(-2, 2, 40))), _signal_rows(t2, list(np.linspace(-1, 3, 40)))])
-    frame["target_1d_open"] = np.linspace(-0.02, 0.02, len(frame))
-    daily = pit.build_daily_feature_frame(frame, "15m", late_minutes=60)
+    first = _signal_rows(t1, list(np.linspace(-2, 2, 40)))
+    second = _signal_rows(t2, list(np.linspace(-1, 3, 40)))
+    for frame in (first, second):
+        frame["target_1d_open"] = np.linspace(-0.02, 0.02, len(frame))
+        frame["target_entry_date_1d_open"] = "2026-01-06"
+        frame["target_exit_date_1d_open"] = "2026-01-06"
+    temporal = pd.DataFrame({"src_theme_id": first["dst_theme_id"], "dst_theme_id": second["dst_theme_id"]})
+    daily = pit.build_daily_feature_frame(pd.concat([first, second]), "15m", late_minutes=60, temporal_edges=temporal)
     assert daily.feature_time.max() == t2
-    assert daily.feature_contract.eq("end_of_day_next_open_execution").all()
+    assert daily.feature_contract.eq("end_of_day_episode_next_open_execution").all()
     assert daily.pit_audit_pass.all()
 
 
@@ -102,6 +107,7 @@ def test_daily_rejects_close_start_label():
     t = pd.Timestamp("2026-01-05 21:00", tz="UTC")
     frame = _signal_rows(t, list(np.linspace(-2, 2, 40)))
     frame["target_1d"] = np.linspace(-0.02, 0.02, len(frame))
+    frame["theme_episode_id"] = [f"episode|{i}" for i in range(len(frame))]
     with pytest.raises(ValueError, match="close-start"):
         pit.build_daily_feature_frame(frame, "15m", late_minutes=60)
 
@@ -126,3 +132,31 @@ def test_daily_label_integration_rejects_close_start_and_maps_next_open():
     assert "label_1d" not in result
     assert result.label_entry_date_2d_open.iloc[0] == "2026-01-06"
     assert result.label_exit_date_2d_open.iloc[0] == "2026-01-07"
+
+
+def test_daily_requires_temporal_episode_identity():
+    t = pd.Timestamp("2026-01-05 21:00", tz="UTC")
+    frame = _signal_rows(t, list(np.linspace(-2, 2, 40)))
+    frame["target_1d_open"] = 0.01
+    frame["target_entry_date_1d_open"] = "2026-01-06"
+    frame["target_exit_date_1d_open"] = "2026-01-06"
+    with pytest.raises(ValueError, match="temporal_theme_edges"):
+        pit.build_daily_feature_frame(frame, "15m", 60)
+
+
+def test_temporal_episode_mapping_links_snapshots_and_daily_uses_final_target():
+    t1 = pd.Timestamp("2026-01-05 15:00", tz="UTC")
+    t2 = pd.Timestamp("2026-01-05 21:00", tz="UTC")
+    first = _signal_rows(t1, list(np.linspace(-2, 2, 40)))
+    second = _signal_rows(t2, list(np.linspace(-1, 3, 40)))
+    first["target_1d_open"] = -0.99
+    second["target_1d_open"] = np.linspace(-0.02, 0.02, 40)
+    for frame in (first, second):
+        frame["target_entry_date_1d_open"] = "2026-01-06"
+        frame["target_exit_date_1d_open"] = "2026-01-06"
+    temporal = pd.DataFrame({"src_theme_id": first["dst_theme_id"].tolist(), "dst_theme_id": second["dst_theme_id"].tolist()})
+    daily = pit.build_daily_feature_frame(pd.concat([first, second]), "15m", 60, temporal)
+    assert len(daily) == 40
+    assert daily.pit_audit_pass.all()
+    assert (daily["target_1d_open"] > -0.1).all()
+    assert daily.feature_contract.eq("end_of_day_episode_next_open_execution").all()
