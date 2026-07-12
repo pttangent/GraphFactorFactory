@@ -1,31 +1,27 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-import argparse, concurrent.futures as cf, json, os, time
+import argparse, concurrent.futures as cf, json, os, re, time
 from dataclasses import dataclass
 from pathlib import Path
-os.environ.setdefault('OMP_NUM_THREADS','1'); os.environ.setdefault('MKL_NUM_THREADS','1'); os.environ.setdefault('OPENBLAS_NUM_THREADS','1'); os.environ.setdefault('NUMEXPR_NUM_THREADS','1'); os.environ.setdefault('ARROW_NUM_THREADS','2')
+os.environ.setdefault('OMP_NUM_THREADS','1'); os.environ.setdefault('MKL_NUM_THREADS','1'); os.environ.setdefault('OPENBLAS_NUM_THREADS','1'); os.environ.setdefault('NUMEXPR_NUM_THREADS','1'); os.environ.setdefault('ARROW_NUM_THREADS','1'); os.environ.setdefault('POLARS_MAX_THREADS','1')
 import numpy as np, pandas as pd, pyarrow as pa, pyarrow.parquet as pq
 HORIZONS=['5m','15m','30m','60m','120m']
 @dataclass(frozen=True)
 class Part: date:str; layer_id:str; scale:str; base:Path
 
-def csvset(s): return None if not s else {x.strip() for x in s.split(',') if x.strip()}
-def csvlist(s): return None if not s else [x.strip() for x in s.split(',') if x.strip()]
-def mins(h): return int(h[:-1]) if h.endswith('m') else (_ for _ in ()).throw(ValueError(h))
+def csvset(s): return None if not s else {x.strip() for x in str(s).split(',') if x.strip()}
+def csvlist(s): return None if not s else [x.strip() for x in str(s).split(',') if x.strip()]
+def mins(h): return int(str(h)[:-1]) if str(h).endswith('m') else (_ for _ in ()).throw(ValueError(h))
 def ext(p,k):
-    for x in p.parts:
+    for x in Path(p).parts:
         if x.startswith(k+'='): return x.split('=',1)[1]
     return None
 def done(m):
     try:
-        j=json.loads(Path(m).read_text()); return j.get('status')=='complete' and int(j.get('output_rows',0))>0
+        j=json.loads(Path(m).read_text(encoding='utf-8')); return j.get('status')=='complete' and int(j.get('output_rows',0))>0
     except Exception: return False
 def manifest(d, meta):
-    d=Path(d); d.mkdir(parents=True,exist_ok=True); t=d/'manifest.json.tmp'; t.write_text(json.dumps(meta,indent=2,ensure_ascii=False)); t.replace(d/'manifest.json')
-def write_parquet_atomic(df, path):
-    path=Path(path); path.parent.mkdir(parents=True,exist_ok=True); tmp=path.with_suffix(path.suffix+'.tmp')
-    if tmp.exists(): tmp.unlink()
-    pq.write_table(pa.Table.from_pandas(df,preserve_index=False), tmp, compression='zstd'); tmp.replace(path)
+    d=Path(d); d.mkdir(parents=True,exist_ok=True); t=d/'manifest.json.tmp'; t.write_text(json.dumps(meta,indent=2,ensure_ascii=False),encoding='utf-8'); t.replace(d/'manifest.json')
 def label_path(root,date):
     r=Path(root); cands=[r if r.is_file() else None, r/f'date={date}'/'labels.parquet', r/'canonical'/f'date={date}'/'labels.parquet', r/date/'labels.parquet']
     for c in cands:
@@ -41,62 +37,101 @@ def discover(root, filename, dates=None, layers=None, scales=None):
         if scales and s not in scales: continue
         out.append(Part(d,l,s,p))
     out.sort(key=lambda x:x.base.stat().st_size, reverse=True); return out
-def load_labels(path,horizons):
-    names=set(pq.ParquetFile(path).schema.names); labs=[f'label_{h}' for h in horizons if f'label_{h}' in names]
-    df=pd.read_parquet(path,columns=['decision_time','symbol_id']+labs); df['decision_time']=pd.to_datetime(df['decision_time'],utc=True); df['symbol_id']=pd.to_numeric(df['symbol_id'],errors='coerce').astype('Int64'); df=df.dropna(subset=['symbol_id']).copy(); df['symbol_id']=df['symbol_id'].astype('int64')
-    for h in horizons:
-        c=f'label_{h}'
-        if c in df:
-            p=df[['decision_time','symbol_id',c]].copy(); p['decision_time']=p['decision_time']+pd.Timedelta(minutes=mins(h)); p=p.rename(columns={c:f'past_label_{h}'}); df=df.merge(p,on=['decision_time','symbol_id'],how='left')
-    return df
 def read_partition(path, cols, max_rg=None):
-    pf=pq.ParquetFile(path); cols=[c for c in cols if c in set(pf.schema.names)]
+    pf=pq.ParquetFile(path); names=set(pf.schema.names); cols=[c for c in cols if c in names]
+    if not cols: return pd.DataFrame()
     if max_rg is None: return pd.read_parquet(path,columns=cols)
     tabs=[pf.read_row_group(i,columns=cols) for i in range(min(max_rg,pf.metadata.num_row_groups))]
     return pa.concat_tables(tabs).to_pandas() if tabs else pd.DataFrame()
+def write_parquet_atomic(df, path):
+    path=Path(path); path.parent.mkdir(parents=True,exist_ok=True); tmp=path.with_suffix(path.suffix+'.tmp')
+    if tmp.exists(): tmp.unlink()
+    pq.write_table(pa.Table.from_pandas(df,preserve_index=False), tmp, compression='zstd'); tmp.replace(path)
 
-def build_returns_one(part, labels_root, out_root, horizons, levels, skip, max_rg):
+def parse_theme_ts_series(s:pd.Series)->pd.Series:
+    tok=s.astype(str).str.extract(r'ts=([^|.]+)', expand=False)
+    direct=pd.to_datetime(tok, utc=True, errors='coerce')
+    miss=direct.isna() & tok.notna()
+    if miss.any():
+        x=tok[miss].str.extract(r'(\d{4}-\d{2}-\d{2})T(\d{2})(\d{2})(\d{2})', expand=True)
+        val=pd.to_datetime(x[0]+' '+x[1]+':'+x[2]+':'+x[3], utc=True, errors='coerce')
+        direct.loc[miss]=val.values
+    return direct
+
+def load_labels(path,horizons):
+    names=set(pq.ParquetFile(path).schema.names); labs=[f'label_{h}' for h in horizons if f'label_{h}' in names]
+    if not labs: raise ValueError(f'no label_* columns for horizons={horizons} in {path}')
+    df=pd.read_parquet(path,columns=['decision_time','symbol_id']+labs)
+    df['decision_time']=pd.to_datetime(df['decision_time'],utc=True); df['symbol_id']=pd.to_numeric(df['symbol_id'],errors='coerce').astype('Int64')
+    df=df.dropna(subset=['decision_time','symbol_id']).copy(); df['symbol_id']=df['symbol_id'].astype('int64')
+    for h in horizons:
+        c=f'label_{h}'
+        if c in df:
+            p=df[['decision_time','symbol_id',c]].copy(); p['decision_time']=p['decision_time']+pd.Timedelta(minutes=mins(h)); p=p.rename(columns={c:f'past_label_{h}'})
+            df=df.merge(p,on=['decision_time','symbol_id'],how='left')
+    return df
+
+def labels_by_time(lab): return {k:v for k,v in lab.groupby('decision_time', sort=False, dropna=False)}
+def stream_df(path, frames):
+    path=Path(path); path.parent.mkdir(parents=True,exist_ok=True); tmp=Path(str(path)+'.tmp')
+    if tmp.exists(): tmp.unlink()
+    writer=None; schema=None; rows=0; batches=0
+    try:
+        for odf in frames:
+            if odf is None or odf.empty: continue
+            table=pa.Table.from_pandas(odf, preserve_index=False)
+            if writer is None:
+                schema=table.schema; writer=pq.ParquetWriter(tmp, schema, compression='zstd')
+            elif table.schema != schema:
+                table=table.cast(schema)
+            writer.write_table(table); rows += len(odf); batches += 1
+    finally:
+        if writer is not None: writer.close()
+    if rows: os.replace(tmp, path)
+    elif tmp.exists(): tmp.unlink()
+    return rows,batches
+
+def build_returns_one(part, labels_root, out_root, horizons, levels, skip, max_rg, inner_workers):
     t=time.time(); out=Path(out_root)/f'date={part.date}'/f'layer_id={part.layer_id}'/f'scale={part.scale}'; op=out/'theme_returns.parquet'
     if skip and done(out/'manifest.json'): return {'stage':'theme_returns','status':'skipped','date':part.date,'layer_id':part.layer_id,'scale':part.scale}
     lab=load_labels(label_path(labels_root,part.date),horizons); alpha=[c for c in lab.columns if c.startswith('label_') or c.startswith('past_label_')]
-    mem=read_partition(part.base,['layer_id','scale','level','theme_id','member_id','core_score','rank_in_theme'],max_rg)
-    if mem.empty: rows=0
+    lbt=labels_by_time(lab)
+    mem=read_partition(part.base,['decision_time','layer_id','scale','level','theme_id','member_id','core_score','rank_in_theme'],max_rg)
+    if mem.empty:
+        rows=batches=0
     else:
-        mem['member_id']=pd.to_numeric(mem['member_id'],errors='coerce').astype('Int64'); mem['core_score']=pd.to_numeric(mem.get('core_score',0),errors='coerce').fillna(0.0); mem=mem.dropna(subset=['member_id','theme_id']).copy(); mem['member_id']=mem['member_id'].astype('int64')
+        if 'decision_time' not in mem or mem['decision_time'].isna().all(): mem['decision_time']=parse_theme_ts_series(mem['theme_id'])
+        mem['decision_time']=pd.to_datetime(mem['decision_time'],utc=True,errors='coerce')
+        mem['member_id']=pd.to_numeric(mem['member_id'],errors='coerce').astype('Int64'); mem['core_score']=pd.to_numeric(mem.get('core_score',0),errors='coerce').fillna(0.0)
+        mem=mem.dropna(subset=['decision_time','member_id','theme_id']).copy(); mem['member_id']=mem['member_id'].astype('int64')
         if 'level' not in mem: mem['level']='UNKNOWN'
         if levels: mem=mem[mem['level'].astype(str).isin(levels)]
         if 'layer_id' not in mem: mem['layer_id']=part.layer_id
         if 'scale' not in mem: mem['scale']=part.scale
-        def _process_chunk(dt, lab_chunk):
-            df=mem.merge(lab_chunk,left_on=['member_id'],right_on=['symbol_id'],how='inner')
+        def one(item):
+            dt,mc=item; lc=lbt.get(dt)
+            if lc is None or mc.empty: return None
+            df=mc.merge(lc,left_on=['decision_time','member_id'],right_on=['decision_time','symbol_id'],how='inner')
             if df.empty: return None
             gcols=['decision_time','layer_id','scale','level','theme_id']; df=df.sort_values(gcols+['core_score'],ascending=[1,1,1,1,1,0]); g=df.groupby(gcols,sort=False)
             res=g[alpha].mean(); res.columns=[c.replace('past_label_','past_eq_') if c.startswith('past_label_') else c.replace('label_','ret_eq_') for c in res.columns]
             w=g['core_score'].sum().replace(0,np.nan)
             for c in alpha:
-                wc = df[c]*df['core_score']
-                res[c.replace('past_label_','past_core_') if c.startswith('past_label_') else c.replace('label_','ret_core_')]=wc.groupby([df[col] for col in gcols],sort=False).sum()/w
+                wc=df[c]*df['core_score']; res[c.replace('past_label_','past_core_') if c.startswith('past_label_') else c.replace('label_','ret_core_')]=wc.groupby([df[col] for col in gcols],sort=False).sum()/w
             top5=g.head(5).groupby(gcols,sort=False)[alpha].mean(); top5.columns=[c.replace('past_label_','past_top5_') if c.startswith('past_label_') else c.replace('label_','ret_top5_') for c in top5.columns]
             return res.join(top5).reset_index()
-        import pyarrow as pa, pyarrow.parquet as pq
-        writer, tmp_op, rows = None, Path(str(op)+'.tmp'), 0
-        tmp_op.parent.mkdir(parents=True, exist_ok=True)
-        with cf.ThreadPoolExecutor(max_workers=8) as ex:
-            futs = [ex.submit(_process_chunk, dt, chunk) for dt, chunk in lab.groupby('decision_time', dropna=False, sort=False)]
-            for f in futs:
-                odf = f.result()
-                if odf is not None and not odf.empty:
-                    table = pa.Table.from_pandas(odf)
-                    if writer is None: writer = pq.ParquetWriter(tmp_op, table.schema)
-                    writer.write_table(table)
-                    rows += len(odf)
-        if writer is not None:
-            writer.close()
-            os.replace(tmp_op, op)
-        elif tmp_op.exists(): tmp_op.unlink()
-    meta={'stage':'theme_returns','status':'complete' if rows else 'empty','date':part.date,'layer_id':part.layer_id,'scale':part.scale,'output_rows':int(rows),'input':str(part.base),'output':str(op),'elapsed_sec':round(time.time()-t,3)}; manifest(out,meta); return meta
+        groups=list(mem.groupby('decision_time', sort=False, dropna=False))
+        if inner_workers and inner_workers>1:
+            def frames():
+                with cf.ThreadPoolExecutor(max_workers=inner_workers) as ex:
+                    futs=[ex.submit(one,g) for g in groups]
+                    for f in cf.as_completed(futs): yield f.result()
+            rows,batches=stream_df(op, frames())
+        else:
+            rows,batches=stream_df(op, (one(g) for g in groups))
+    meta={'stage':'theme_returns','status':'complete' if rows else 'empty','date':part.date,'layer_id':part.layer_id,'scale':part.scale,'output_rows':int(rows),'write_batches':int(batches),'input':str(part.base),'output':str(op),'elapsed_sec':round(time.time()-t,3),'time_aligned_join':True,'inner_workers':inner_workers}; manifest(out,meta); return meta
 
-def relation_one(part, returns_root, out_root, horizons, past_h, levels, tiers, skip, max_rg):
+def relation_one(part, returns_root, out_root, horizons, past_h, levels, tiers, skip, max_rg, inner_workers):
     t=time.time(); rp=Path(returns_root)/f'date={part.date}'/f'layer_id={part.layer_id}'/f'scale={part.scale}'/'theme_returns.parquet'; out=Path(out_root)/f'date={part.date}'/f'layer_id={part.layer_id}'/f'scale={part.scale}'; op=out/'relation_spillover_signals.parquet'
     if skip and done(out/'manifest.json'): return {'stage':'relation_spillover','status':'skipped','date':part.date,'layer_id':part.layer_id,'scale':part.scale}
     if not rp.exists(): return {'stage':'relation_spillover','status':'missing_theme_returns','date':part.date,'layer_id':part.layer_id,'scale':part.scale}
@@ -105,39 +140,36 @@ def relation_one(part, returns_root, out_root, horizons, past_h, levels, tiers, 
     targets=[f'ret_eq_{h}' for h in horizons if f'ret_eq_{h}' in r]
     past=r[['decision_time','layer_id','scale','level','theme_id',pc]].rename(columns={'theme_id':'src_theme_id',pc:'src_past_return'})
     fut=r[['decision_time','layer_id','scale','level','theme_id']+targets].rename(columns={'theme_id':'dst_theme_id',**{c:c.replace('ret_eq_','target_') for c in targets}})
-    e=read_partition(part.base,['layer_id','scale','level','src_theme_id','dst_theme_id','relation_strength','relation_tier','hard_keep','edge_count'],max_rg)
-    if e.empty: rows=0
+    fbt={k:v for k,v in fut.groupby('decision_time', sort=False, dropna=False)}
+    e=read_partition(part.base,['decision_time','layer_id','scale','level','src_theme_id','dst_theme_id','relation_strength','relation_tier','hard_keep','edge_count'],max_rg)
+    if e.empty: rows=batches=0
     else:
+        if 'decision_time' not in e or e['decision_time'].isna().all(): e['decision_time']=parse_theme_ts_series(e['src_theme_id'])
+        e['decision_time']=pd.to_datetime(e['decision_time'],utc=True,errors='coerce'); e=e.dropna(subset=['decision_time','src_theme_id','dst_theme_id']).copy()
         if levels and 'level' in e: e=e[e['level'].astype(str).isin(levels)]
         if tiers and 'relation_tier' in e: e=e[e['relation_tier'].astype(str).isin(tiers)]
         if 'layer_id' not in e: e['layer_id']=part.layer_id
         if 'scale' not in e: e['scale']=part.scale
-        def _process_rel_chunk(dt, past_chunk):
-            m=e.merge(past_chunk,on=['layer_id','scale','level','src_theme_id'],how='inner')
+        def one(item):
+            dt,pcu=item; ecu=e[e['decision_time'].eq(dt)]
+            if ecu.empty: return None
+            m=ecu.merge(pcu,on=['decision_time','layer_id','scale','level','src_theme_id'],how='inner')
             if m.empty: return None
             m['signal']=pd.to_numeric(m['relation_strength'],errors='coerce').fillna(0)*pd.to_numeric(m['src_past_return'],errors='coerce').fillna(0)
             a=m.groupby(['decision_time','layer_id','scale','level','dst_theme_id'],sort=False).agg(signal=('signal','mean'),relation_strength_mean=('relation_strength','mean'),relation_edge_count=('src_theme_id','size')).reset_index()
-            fut_chunk = fut[fut['decision_time'] == dt]
-            z=a.merge(fut_chunk,on=['decision_time','layer_id','scale','level','dst_theme_id'],how='inner')
-            return z if not z.empty else None
-        import pyarrow as pa, pyarrow.parquet as pq
-        writer, tmp_op, rows = None, Path(str(op)+'.tmp'), 0
-        tmp_op.parent.mkdir(parents=True, exist_ok=True)
-        with cf.ThreadPoolExecutor(max_workers=8) as ex:
-            futs = [ex.submit(_process_rel_chunk, dt, chunk) for dt, chunk in past.groupby('decision_time', dropna=False, sort=False)]
-            for f in futs:
-                odf = f.result()
-                if odf is not None and not odf.empty:
-                    odf.insert(1,'date',part.date)
-                    table = pa.Table.from_pandas(odf)
-                    if writer is None: writer = pq.ParquetWriter(tmp_op, table.schema)
-                    writer.write_table(table)
-                    rows += len(odf)
-        if writer is not None:
-            writer.close()
-            os.replace(tmp_op, op)
-        elif tmp_op.exists(): tmp_op.unlink()
-    meta={'stage':'relation_spillover','status':'complete' if rows else 'empty','date':part.date,'layer_id':part.layer_id,'scale':part.scale,'output_rows':int(rows),'input':str(part.base),'theme_returns':str(rp),'output':str(op),'elapsed_sec':round(time.time()-t,3)}; manifest(out,meta); return meta
+            z=a.merge(fbt.get(dt,pd.DataFrame()),on=['decision_time','layer_id','scale','level','dst_theme_id'],how='inner')
+            if z.empty: return None
+            z.insert(1,'date',part.date); return z
+        groups=list(past.groupby('decision_time', sort=False, dropna=False))
+        if inner_workers and inner_workers>1:
+            def frames():
+                with cf.ThreadPoolExecutor(max_workers=inner_workers) as ex:
+                    futs=[ex.submit(one,g) for g in groups]
+                    for f in cf.as_completed(futs): yield f.result()
+            rows,batches=stream_df(op, frames())
+        else:
+            rows,batches=stream_df(op, (one(g) for g in groups))
+    meta={'stage':'relation_spillover','status':'complete' if rows else 'empty','date':part.date,'layer_id':part.layer_id,'scale':part.scale,'output_rows':int(rows),'write_batches':int(batches),'input':str(part.base),'theme_returns':str(rp),'output':str(op),'elapsed_sec':round(time.time()-t,3),'time_aligned_join':True,'inner_workers':inner_workers}; manifest(out,meta); return meta
 
 def path_id(s): return s.astype(str).str.replace(r'([.|_\-])?ts=[^.|_\-]+','',regex=True).str.replace(r'([.|_\-])?time=[^.|_\-]+','',regex=True)
 def daily_one(part, out_root, late_min, skip, max_rg):
@@ -180,21 +212,22 @@ def pool(parts,workers,fn,*args):
     if not parts: return []
     res=[]
     with cf.ProcessPoolExecutor(max_workers=workers) as ex:
-        for f in cf.as_completed([ex.submit(fn,p,*args) for p in parts]): res.append(f.result())
+        futs=[ex.submit(fn,p,*args) for p in parts]
+        for f in cf.as_completed(futs): res.append(f.result())
     return res
-def save_summary(root,res): Path(root).mkdir(parents=True,exist_ok=True); (Path(root)/'run_summary.json').write_text(json.dumps(res,indent=2,ensure_ascii=False))
+def save_summary(root,res): Path(root).mkdir(parents=True,exist_ok=True); (Path(root)/'run_summary.json').write_text(json.dumps(res,indent=2,ensure_ascii=False),encoding='utf-8')
 
 def main():
     p=argparse.ArgumentParser(); sub=p.add_subparsers(dest='cmd',required=True)
     def common(x):
-        x.add_argument('--dates'); x.add_argument('--layers'); x.add_argument('--scales'); x.add_argument('--levels',default='B50,B35'); x.add_argument('--horizons',default=','.join(HORIZONS)); x.add_argument('--workers',type=int,default=16); x.add_argument('--max-row-groups',type=int); x.add_argument('--skip-existing',action='store_true')
+        x.add_argument('--dates'); x.add_argument('--layers'); x.add_argument('--scales'); x.add_argument('--levels',default='B50,B35'); x.add_argument('--horizons',default=','.join(HORIZONS)); x.add_argument('--workers',type=int,default=16); x.add_argument('--inner-workers',type=int,default=1); x.add_argument('--max-row-groups',type=int); x.add_argument('--skip-existing',action='store_true')
     a=sub.add_parser('build-theme-returns'); common(a); a.add_argument('--p1-root',required=True); a.add_argument('--labels-root',required=True); a.add_argument('--out-root',required=True)
     a=sub.add_parser('relation-spillover'); common(a); a.add_argument('--p1-root',required=True); a.add_argument('--theme-returns-root',required=True); a.add_argument('--out-root',required=True); a.add_argument('--past-horizon',default='15m'); a.add_argument('--tiers')
     a=sub.add_parser('daily-relation-features'); common(a); a.add_argument('--signals-root',required=True); a.add_argument('--out-root',required=True); a.add_argument('--late-minutes',type=int,default=60)
     a=sub.add_parser('evaluate-daily'); a.add_argument('--features-root',required=True); a.add_argument('--out-dir',required=True)
     args=p.parse_args(); dates,layers,scales,levels=csvset(getattr(args,'dates',None)),csvset(getattr(args,'layers',None)),csvset(getattr(args,'scales',None)),csvset(getattr(args,'levels',None)); horizons=csvlist(getattr(args,'horizons',None)) or HORIZONS
-    if args.cmd=='build-theme-returns': parts=discover(args.p1_root,'theme_memberships.parquet',dates,layers,scales); res=pool(parts,args.workers,build_returns_one,args.labels_root,args.out_root,horizons,levels,args.skip_existing,args.max_row_groups); save_summary(args.out_root,res); print(json.dumps({'stage':args.cmd,'parts':len(parts),'results':len(res),'out_root':args.out_root},indent=2))
-    elif args.cmd=='relation-spillover': parts=discover(args.p1_root,'theme_relation_edges.parquet',dates,layers,scales); res=pool(parts,args.workers,relation_one,args.theme_returns_root,args.out_root,horizons,args.past_horizon,levels,csvset(args.tiers),args.skip_existing,args.max_row_groups); save_summary(args.out_root,res); print(json.dumps({'stage':args.cmd,'parts':len(parts),'results':len(res),'out_root':args.out_root},indent=2))
+    if args.cmd=='build-theme-returns': parts=discover(args.p1_root,'theme_memberships.parquet',dates,layers,scales); res=pool(parts,args.workers,build_returns_one,args.labels_root,args.out_root,horizons,levels,args.skip_existing,args.max_row_groups,args.inner_workers); save_summary(args.out_root,res); print(json.dumps({'stage':args.cmd,'parts':len(parts),'results':len(res),'out_root':args.out_root},indent=2))
+    elif args.cmd=='relation-spillover': parts=discover(args.p1_root,'theme_relation_edges.parquet',dates,layers,scales); res=pool(parts,args.workers,relation_one,args.theme_returns_root,args.out_root,horizons,args.past_horizon,levels,csvset(args.tiers),args.skip_existing,args.max_row_groups,args.inner_workers); save_summary(args.out_root,res); print(json.dumps({'stage':args.cmd,'parts':len(parts),'results':len(res),'out_root':args.out_root},indent=2))
     elif args.cmd=='daily-relation-features': parts=discover(args.signals_root,'relation_spillover_signals.parquet',dates,layers,scales); res=pool(parts,args.workers,daily_one,args.out_root,args.late_minutes,args.skip_existing,args.max_row_groups); save_summary(args.out_root,res); print(json.dumps({'stage':args.cmd,'parts':len(parts),'results':len(res),'out_root':args.out_root},indent=2))
     elif args.cmd=='evaluate-daily': print(json.dumps(eval_daily(args.features_root,args.out_dir),indent=2))
 if __name__=='__main__': main()
