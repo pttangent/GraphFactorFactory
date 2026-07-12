@@ -1,254 +1,228 @@
 #!/usr/bin/env python3
-"""Build stable cross-day daily forward-return labels.
+"""Build cross-day labels with an explicit execution-time contract.
 
-This script intentionally refuses to create mock data unless --allow-mock is
-explicitly set.  Daily labels are only valid when they are built on a stable
-cross-date identifier such as stable_symbol_id, ticker, FIGI, or another
-canonical ID.  Do not join date-local symbol_id across days.
+For an end-of-day feature that is only known after the final intraday snapshot,
+``close_t -> future close`` is not executable. The live-safe labels produced
+here therefore include ``next_open_to_tNd_close``.
 """
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
+import re
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pandas as pd
-import pyzipper
-import hashlib
-import io
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+try:
+    import pyzipper
+except ImportError:  # optional encrypted input support
+    pyzipper = None
+
 LOG = logging.getLogger("build_daily_labels")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 
-def generate_zip_password(filename):
-    SALT = "vvtr123!@#qwe"
-    data_to_hash = f"{filename}{SALT}".encode('utf-8')
-    return hashlib.sha256(data_to_hash).hexdigest().encode('utf-8')
+def generate_zip_password(filename: str) -> bytes:
+    salt = "vvtr123!@#qwe"
+    return hashlib.sha256(f"{filename}{salt}".encode("utf-8")).hexdigest().encode("utf-8")
 
 
-def read_parquet_input(path: Path) -> pd.DataFrame:
-    if path.is_dir():
-        zips = sorted(path.rglob("*.zip"))
-        if zips:
-            dfs = []
-            for z_path in zips:
-                pwd = generate_zip_password(z_path.name)
-                with pyzipper.AESZipFile(z_path) as z:
-                    csv_name = z.namelist()[0]
-                    with z.open(csv_name, pwd=pwd) as f:
-                        dfs.append(pd.read_csv(f))
-            LOG.info("Loaded %d encrypted zip files from %s", len(dfs), path)
-            return pd.concat(dfs, ignore_index=True)
+def read_price_input(path: Path) -> pd.DataFrame:
+    if path.is_file():
+        return pd.read_parquet(path)
+    zips = sorted(path.rglob("*.zip"))
+    if zips:
+        if pyzipper is None:
+            raise RuntimeError("pyzipper is required to read encrypted ZIP inputs")
+        frames = []
+        for zip_path in zips:
+            with pyzipper.AESZipFile(zip_path) as archive:
+                names = [name for name in archive.namelist() if not name.endswith("/")]
+                if not names:
+                    continue
+                with archive.open(names[0], pwd=generate_zip_password(zip_path.name)) as source:
+                    frames.append(pd.read_csv(source))
+        if not frames:
+            raise FileNotFoundError(f"no readable rows under {path}")
+        return pd.concat(frames, ignore_index=True)
+    files = sorted(path.rglob("*.parquet"))
+    if not files:
+        raise FileNotFoundError(f"no parquet or encrypted ZIP files under {path}")
+    return pd.concat((pd.read_parquet(file) for file in files), ignore_index=True)
 
-        files = sorted(path.rglob("*.parquet"))
-        if not files:
-            raise FileNotFoundError(f"No parquet or zip files under {path}")
-        LOG.info("Loading %d parquet files from %s", len(files), path)
-        return pd.concat((pd.read_parquet(f) for f in files), ignore_index=True)
-    LOG.info("Loading parquet file %s", path)
-    return pd.read_parquet(path)
 
-
-def ensure_columns(df: pd.DataFrame, required: list[str]) -> None:
-    missing = [c for c in required if c not in df.columns]
+def require_columns(frame: pd.DataFrame, columns: list[str]) -> None:
+    missing = [column for column in columns if column not in frame]
     if missing:
-        raise ValueError(f"Missing required columns: {missing}; available={list(df.columns)}")
+        raise ValueError(f"missing required columns: {missing}; available={list(frame.columns)}")
 
 
 def build_daily_labels(
-    prices_df: pd.DataFrame,
-    date_col: str,
-    stable_id_col: str,
-    symbol_col: str | None,
-    open_col: str,
-    close_col: str,
+    prices: pd.DataFrame,
+    *,
+    date_col: str = "date",
+    stable_id_col: str = "stable_symbol_id",
+    symbol_col: str | None = "symbol",
+    open_col: str = "open",
+    close_col: str = "close",
+    max_horizon: int | None = None,
 ) -> pd.DataFrame:
-    required = [date_col, stable_id_col, open_col, close_col]
-    if symbol_col:
-        required.append(symbol_col)
-    ensure_columns(prices_df, required)
+    required = [date_col, stable_id_col, open_col, close_col] + ([symbol_col] if symbol_col else [])
+    require_columns(prices, required)
+    frame = prices.copy()
+    frame[date_col] = pd.to_datetime(frame[date_col], utc=True, errors="coerce").dt.date
+    frame[open_col] = pd.to_numeric(frame[open_col], errors="coerce")
+    frame[close_col] = pd.to_numeric(frame[close_col], errors="coerce")
+    frame = frame.dropna(subset=[date_col, stable_id_col, open_col, close_col])
+    frame = frame[(frame[open_col] > 0) & (frame[close_col] > 0)].copy()
+    duplicates = frame.duplicated([date_col, stable_id_col], keep=False)
+    if duplicates.any():
+        sample = frame.loc[duplicates, [date_col, stable_id_col]].head(10).to_dict("records")
+        raise ValueError(f"duplicate daily OHLC rows for stable symbol/date; sample={sample}")
+    frame = frame.sort_values([stable_id_col, date_col]).copy()
+    grouped = frame.groupby(stable_id_col, sort=False)
 
-    df = prices_df.copy()
-    df[date_col] = pd.to_datetime(df[date_col], utc=True).dt.date
-    df[open_col] = pd.to_numeric(df[open_col], errors="coerce")
-    df[close_col] = pd.to_numeric(df[close_col], errors="coerce")
-    df = df.dropna(subset=[date_col, stable_id_col, open_col, close_col]).copy()
-    df = df[(df[open_col] > 0) & (df[close_col] > 0)].copy()
+    counts = grouped.size()
+    inferred_max = max(int(counts.max()) - 1, 1)
+    max_horizon = inferred_max if max_horizon is None else min(max_horizon, inferred_max)
+    frame["close_t"] = frame[close_col]
+    frame["open_t"] = frame[open_col]
+    frame["next_trade_date"] = grouped[date_col].shift(-1)
+    frame["next_open"] = grouped[open_col].shift(-1)
+    frame["next_close"] = grouped[close_col].shift(-1)
+    frame["close_to_next_open"] = frame["next_open"] / frame["close_t"] - 1.0
+    frame["next_open_to_close"] = frame["next_close"] / frame["next_open"] - 1.0
+    frame["close_to_next_close"] = frame["next_close"] / frame["close_t"] - 1.0
 
-    df = df.drop_duplicates(subset=[date_col, stable_id_col], keep="last").copy()
-    dup = int(df.duplicated([date_col, stable_id_col]).sum())
-    if dup > 0:
-        raise ValueError(
-            f"Found {dup} duplicate rows for ({date_col}, {stable_id_col}); "
-            "daily label builder requires one OHLC row per stable symbol per date."
-        )
-
-    df = df.sort_values([stable_id_col, date_col]).copy()
-    group = df.groupby(stable_id_col, sort=False)
-
-    df["next_trade_date"] = group[date_col].shift(-1)
-    df["next_open"] = group[open_col].shift(-1)
-    df["next_close"] = group[close_col].shift(-1)
-
-    df["close_t"] = df[close_col]
-    df["open_t"] = df[open_col]
-    df["close_to_next_open"] = df["next_open"] / df["close_t"] - 1.0
-    df["next_open_to_close"] = df["next_close"] / df["next_open"] - 1.0
-    df["close_to_next_close"] = df["next_close"] / df["close_t"] - 1.0
-
-    out_data = {
-        "date": pd.to_datetime(df[date_col]).dt.strftime("%Y-%m-%d"),
-        "stable_symbol_id": df[stable_id_col].astype(str),
-        "open_t": df["open_t"],
-        "close_t": df["close_t"],
-        "next_trade_date": pd.to_datetime(df["next_trade_date"]).dt.strftime("%Y-%m-%d"),
-        "next_open": df["next_open"],
-        "next_close": df["next_close"],
-        "close_to_next_open": df["close_to_next_open"],
-        "next_open_to_close": df["next_open_to_close"],
-        "close_to_next_close": df["close_to_next_close"],
+    output: dict[str, Any] = {
+        "date": pd.to_datetime(frame[date_col]).dt.strftime("%Y-%m-%d"),
+        "stable_symbol_id": frame[stable_id_col].astype(str),
+        "open_t": frame["open_t"],
+        "close_t": frame["close_t"],
+        "next_trade_date": pd.to_datetime(frame["next_trade_date"]).dt.strftime("%Y-%m-%d"),
+        "next_open": frame["next_open"],
+        "next_close": frame["next_close"],
+        "close_to_next_open": frame["close_to_next_open"],
+        "next_open_to_close": frame["next_open_to_close"],
+        "close_to_next_close": frame["close_to_next_close"],
+        "next_open_to_t1_close": frame["next_open_to_close"],
+        "t1_trade_date": pd.to_datetime(frame["next_trade_date"]).dt.strftime("%Y-%m-%d"),
     }
-
-    max_n = df.groupby(stable_id_col, sort=False).size().max()
-    for n in range(2, max_n):
-        df[f"t{n}_trade_date"] = group[date_col].shift(-n)
-        df[f"t{n}_close"] = group[close_col].shift(-n)
-        df[f"t{n}_open"] = group[open_col].shift(-n)
-        df[f"t{n}_close_return"] = df[f"t{n}_close"] / df["close_t"] - 1.0
-        df[f"t{n}_open_return"] = df[f"t{n}_open"] / df["close_t"] - 1.0
-        
-        out_data[f"t{n}_trade_date"] = pd.to_datetime(df[f"t{n}_trade_date"]).dt.strftime("%Y-%m-%d")
-        out_data[f"t{n}_close_return"] = df[f"t{n}_close_return"]
-        out_data[f"t{n}_open_return"] = df[f"t{n}_open_return"]
-
-    out = pd.DataFrame(out_data)
     if symbol_col:
-        out.insert(2, "symbol", df[symbol_col].astype(str).values)
+        output["symbol"] = frame[symbol_col].astype(str)
 
-    # Keep rows with at least a T+1 close label.  T+3/T+5 can be NaN near the end.
-    out = out.dropna(subset=["close_to_next_close"]).reset_index(drop=True)
-    return out
+    for horizon in range(2, max_horizon + 1):
+        trade_date = grouped[date_col].shift(-horizon)
+        future_open = grouped[open_col].shift(-horizon)
+        future_close = grouped[close_col].shift(-horizon)
+        output[f"t{horizon}_trade_date"] = pd.to_datetime(trade_date).dt.strftime("%Y-%m-%d")
+        output[f"t{horizon}_close_return"] = future_close / frame["close_t"] - 1.0
+        output[f"t{horizon}_open_return"] = future_open / frame["close_t"] - 1.0
+        output[f"next_open_to_t{horizon}_close"] = future_close / frame["next_open"] - 1.0
+
+    labels = pd.DataFrame(output)
+    labels["daily_feature_available_after"] = labels["date"]
+    labels["daily_execution_policy"] = "next_session_open"
+    labels = labels.dropna(subset=["next_open_to_t1_close"]).reset_index(drop=True)
+    return labels
+
+
+def validate_labels(labels: pd.DataFrame, max_abs_return: float, allow_extreme_returns: bool) -> dict[str, Any]:
+    return_columns = [
+        column
+        for column in labels
+        if column in {"close_to_next_open", "next_open_to_close", "close_to_next_close"}
+        or column.endswith("_return")
+        or re.fullmatch(r"next_open_to_t\d+_close", column)
+    ]
+    report: dict[str, Any] = {
+        "rows": len(labels),
+        "dates": labels["date"].nunique(),
+        "stable_symbols": labels["stable_symbol_id"].nunique(),
+        "daily_execution_policy": "next_session_open",
+        "live_safe_target_pattern": "next_open_to_tNd_close",
+        "return_columns": {},
+    }
+    errors = []
+    for column in return_columns:
+        values = pd.to_numeric(labels[column], errors="coerce")
+        extreme_count = int((values.abs() > max_abs_return).sum())
+        report["return_columns"][column] = {
+            "count": int(values.notna().sum()),
+            "mean": float(values.mean()) if values.notna().any() else None,
+            "max_abs": float(values.abs().max()) if values.notna().any() else None,
+            "extreme_count": extreme_count,
+        }
+        if extreme_count:
+            errors.append(f"{column}: {extreme_count}")
+    if errors and not allow_extreme_returns:
+        raise ValueError("daily label sanity check failed: " + "; ".join(errors))
+    return report
 
 
 def make_mock_prices() -> pd.DataFrame:
     rng = np.random.default_rng(7)
     dates = pd.date_range("2026-01-01", "2026-06-30", freq="B")
-    symbols = [f"MOCK_{i:04d}" for i in range(1, 101)]
-    records: list[dict[str, Any]] = []
-    for i, symbol in enumerate(symbols, 1):
-        price = 50.0 + i * 0.1
-        for d in dates:
-            overnight = rng.normal(0, 0.01)
-            intraday = rng.normal(0, 0.015)
-            open_px = max(0.5, price * (1 + overnight))
-            close_px = max(0.5, open_px * (1 + intraday))
-            records.append({
-                "date": d.strftime("%Y-%m-%d"),
-                "stable_symbol_id": f"MOCK_{i:04d}",
-                "symbol": symbol,
-                "open": open_px,
-                "close": close_px,
-            })
-            price = close_px
-    return pd.DataFrame(records)
-
-
-def validate_labels(labels: pd.DataFrame, max_abs_return: float, allow_extreme_returns: bool) -> dict[str, Any]:
-    ret_cols = [c for c in labels.columns if "return" in c or c in ["close_to_next_open", "next_open_to_close", "close_to_next_close"]]
-    report: dict[str, Any] = {
-        "rows": int(len(labels)),
-        "dates": int(labels["date"].nunique()) if "date" in labels else 0,
-        "stable_symbols": int(labels["stable_symbol_id"].nunique()) if "stable_symbol_id" in labels else 0,
-        "max_abs_return_threshold": float(max_abs_return),
-        "return_columns": {},
-    }
-    extreme_messages: list[str] = []
-    for col in ret_cols:
-        s = pd.to_numeric(labels[col], errors="coerce")
-        max_abs = float(s.abs().max(skipna=True)) if s.notna().any() else float("nan")
-        cnt = int((s.abs() > max_abs_return).sum())
-        report["return_columns"][col] = {
-            "count": int(s.notna().sum()),
-            "mean": float(s.mean(skipna=True)) if s.notna().any() else None,
-            "max_abs": max_abs,
-            "extreme_count": cnt,
-        }
-        if cnt > 0:
-            extreme_messages.append(f"{col}: {cnt} rows exceed abs(return)>{max_abs_return}")
-    if extreme_messages and not allow_extreme_returns:
-        raise ValueError(
-            "Daily label sanity check failed; possible split/ID/price issue. "
-            + "; ".join(extreme_messages)
-        )
-    return report
+    rows = []
+    for index in range(100):
+        price = 50 + index / 10
+        for date in dates:
+            open_price = max(0.5, price * (1 + rng.normal(0, 0.01)))
+            close_price = max(0.5, open_price * (1 + rng.normal(0, 0.015)))
+            rows.append({"date": date, "stable_symbol_id": f"MOCK_{index:04d}", "symbol": f"MOCK_{index:04d}", "open": open_price, "close": close_price})
+            price = close_price
+    return pd.DataFrame(rows)
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Build cross-day daily labels from stable-symbol OHLC prices.")
-    parser.add_argument("--raw-daily-prices", default=None, help="Parquet file or directory with daily OHLC rows.")
-    parser.add_argument("--out-path", required=True, help="Output daily_labels.parquet path.")
+    parser = argparse.ArgumentParser(description="Build PIT-safe next-open daily forward-return labels")
+    parser.add_argument("--raw-daily-prices")
+    parser.add_argument("--out-path", required=True)
     parser.add_argument("--date-col", default="date")
     parser.add_argument("--stable-id-col", default="stable_symbol_id")
-    parser.add_argument("--symbol-col", default="symbol", help="Set to empty string if no symbol column exists.")
+    parser.add_argument("--symbol-col", default="symbol")
     parser.add_argument("--open-col", default="open")
     parser.add_argument("--close-col", default="close")
-    parser.add_argument("--max-abs-return", type=float, default=5.0, help="Fail if any label return exceeds this abs threshold unless allowed.")
+    parser.add_argument("--max-horizon", type=int)
+    parser.add_argument("--max-abs-return", type=float, default=5.0)
     parser.add_argument("--allow-extreme-returns", action="store_true")
-    parser.add_argument("--allow-mock", action="store_true", help="Explicitly generate mock labels for pipeline smoke tests only.")
-    parser.add_argument("--report-path", default=None, help="Optional JSON label report path.")
+    parser.add_argument("--allow-mock", action="store_true")
+    parser.add_argument("--report-path")
     args = parser.parse_args()
 
-    out_path = Path(args.out_path)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    report_path = Path(args.report_path) if args.report_path else out_path.with_suffix(".report.json")
-
     if args.raw_daily_prices:
-        prices = read_parquet_input(Path(args.raw_daily_prices))
-        source = str(args.raw_daily_prices)
+        prices = read_price_input(Path(args.raw_daily_prices))
+        source = args.raw_daily_prices
         is_mock = False
     elif args.allow_mock:
-        LOG.warning("Generating explicit MOCK daily labels. Do not use this for alpha research.")
         prices = make_mock_prices()
         source = "mock"
         is_mock = True
     else:
-        raise SystemExit(
-            "Missing --raw-daily-prices. Refusing to generate mock daily_labels.parquet. "
-            "Use --allow-mock only for smoke tests."
-        )
+        raise SystemExit("missing --raw-daily-prices; use --allow-mock only for smoke tests")
 
-    symbol_col = args.symbol_col.strip() or None
     labels = build_daily_labels(
         prices,
         date_col=args.date_col,
         stable_id_col=args.stable_id_col,
-        symbol_col=symbol_col,
+        symbol_col=args.symbol_col.strip() or None,
         open_col=args.open_col,
         close_col=args.close_col,
+        max_horizon=args.max_horizon,
     )
     report = validate_labels(labels, args.max_abs_return, args.allow_extreme_returns)
-    report.update({
-        "source": source,
-        "is_mock": is_mock,
-        "date_col": args.date_col,
-        "stable_id_col": args.stable_id_col,
-        "symbol_col": symbol_col,
-        "open_col": args.open_col,
-        "close_col": args.close_col,
-        "output": str(out_path),
-    })
-
-    if is_mock and "mock" not in out_path.name.lower():
-        LOG.warning("Mock labels are being written to a non-mock-looking filename: %s", out_path)
-
-    labels.to_parquet(out_path, index=False)
+    report.update({"source": source, "is_mock": is_mock})
+    output = Path(args.out_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    labels.to_parquet(output, index=False)
+    report_path = Path(args.report_path) if args.report_path else output.with_suffix(".report.json")
     report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
-    LOG.info("Wrote %d daily label rows to %s", len(labels), out_path)
-    LOG.info("Wrote label report to %s", report_path)
+    LOG.info("wrote %d rows to %s", len(labels), output)
 
 
 if __name__ == "__main__":
