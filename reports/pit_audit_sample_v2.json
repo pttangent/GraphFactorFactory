@@ -23,8 +23,16 @@
   "daily_contract": {
     "status": "pass_by_unit_and_schema_contract",
     "feature_availability": "after final session snapshot",
+    "theme_identity": "within-session temporal episodes built from temporal_theme_edges.parquet",
+    "eligible_universe": "episodes alive at the final session snapshot",
+    "target_composition": "final-snapshot member basket only",
     "accepted_targets": "label_Nd_open only",
     "rejected_targets": "label_Nd close-start labels",
-    "sample_note": "provided sample contains intraday labels only; daily next-open integration is covered by deterministic tests"
+    "sample_note": "the supplied sample contains intraday labels but no daily next-open labels or temporal_theme_edges.parquet; empirical results in this report are intraday only"
+  },
+  "validation": {
+    "unit_tests": "12 passed",
+    "python_compileall": "passed",
+    "scheduler_daily_dry_run": "passed with --p1-root and label_Nd_open horizons"
   }
 }
