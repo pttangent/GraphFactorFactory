@@ -1,0 +1,30 @@
+{
+  "audit_contract": "p2-pit-v2",
+  "all_checks_passed": true,
+  "checks": [
+    {"name": "p0_windows_end_at_or_before_decision_time", "passed": true, "details": {"invalid_rows": 0}},
+    {"name": "label_target_timing", "passed": true, "details": {"invalid_rows": 0, "minimum_entry_lag_minutes": 5}},
+    {"name": "theme_return_availability", "passed": true, "details": {"past_invalid_rows": 0, "target_invalid_rows": 0}},
+    {"name": "relation_direction_and_source_availability", "passed": true, "details": {"semantics": [["symmetric_neighbor_diffusion"]], "unavailable_rows": 0}},
+    {"name": "intraday_snapshot_features", "passed": true, "details": {"failed_rows": 0, "residual_path_rows": 0, "max_abs_snapshot_z_mean": 1.5860328923216522e-16}},
+    {"name": "intraday_evaluation_is_per_snapshot", "passed": true, "details": {"metric_rows": 2888, "unique_decision_times": 366}}
+  ],
+  "legacy_findings": {
+    "partial_timestamp_path_rows": 348221,
+    "rows_that_were_actually_single_snapshot": 348221,
+    "note": "legacy file was mislabeled daily; path regex left a partial timestamp and evaluation pooled snapshots"
+  },
+  "factor_audit": [
+    {"factor": "daily_pressure_score", "direct_future_target": "pass", "normalization_scope": "snapshot", "evaluation_scope": "snapshot", "audit_status": "pass", "mean_rank_ic_5m": -8.556019439986353e-05, "mean_rank_ic_15m": -0.0004685430645209},
+    {"factor": "daily_consensus_score", "direct_future_target": "pass", "normalization_scope": "snapshot", "evaluation_scope": "snapshot", "audit_status": "pass", "mean_rank_ic_5m": 0.0014718249549279, "mean_rank_ic_15m": -0.002959923827916},
+    {"factor": "late_confirmation_score_z", "direct_future_target": "pass", "normalization_scope": "snapshot", "evaluation_scope": "snapshot", "audit_status": "pass", "mean_rank_ic_5m": 0.0049191392296254, "mean_rank_ic_15m": 0.0045151091260171},
+    {"factor": "daily_underreaction_score", "direct_future_target": "pass", "normalization_scope": "snapshot", "evaluation_scope": "snapshot", "audit_status": "pass", "mean_rank_ic_5m": 0.0093817471314587, "mean_rank_ic_15m": 0.0086229307153459}
+  ],
+  "daily_contract": {
+    "status": "pass_by_unit_and_schema_contract",
+    "feature_availability": "after final session snapshot",
+    "accepted_targets": "label_Nd_open only",
+    "rejected_targets": "label_Nd close-start labels",
+    "sample_note": "provided sample contains intraday labels only; daily next-open integration is covered by deterministic tests"
+  }
+}
