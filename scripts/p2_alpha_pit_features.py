@@ -10,7 +10,7 @@ from pathlib import Path
 from p2_pit_core import *
 from p2_pit_theme import *
 from p2_pit_features import *
-from p2_pit_features import _build_feature_one
+from p2_pit_runner import build_feature_one
 
 
 def pool(parts: list[Part], workers: int, function, *args) -> list[dict]:
@@ -96,7 +96,7 @@ def main() -> None:
         parts = discover(args.signals_root, "relation_spillover_signals.parquet", dates, layers, scales)
         if mode == "daily" and not args.p1_root:
             raise SystemExit("daily-relation-features requires --p1-root for temporal episode identity")
-        results = pool(parts, args.workers, _build_feature_one, args.out_root, mode, args.underreaction_past_horizon, args.late_minutes, args.skip_existing, args.max_row_groups, args.p1_root)
+        results = pool(parts, args.workers, build_feature_one, args.out_root, mode, args.underreaction_past_horizon, args.late_minutes, args.skip_existing, args.max_row_groups, args.p1_root)
         save_run_summary(args.out_root, results)
     elif args.command == "evaluate-intraday":
         results = evaluate_feature_root(args.features_root, args.out_dir, "intraday")
