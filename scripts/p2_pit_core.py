@@ -1,0 +1,295 @@
+#!/usr/bin/env python3
+"""Point-in-time-safe P2 theme/relation alpha pipeline.
+
+The pipeline deliberately separates two contracts:
+
+* intraday: one feature row per decision_time and theme; all normalization and
+  evaluation are cross-sectional inside that snapshot; only minute targets
+  whose entry_time is strictly after feature_time are accepted.
+* daily: full-session aggregation is allowed, but the feature is available only
+  after the final snapshot and only next-open-executable daily labels are
+  accepted (for example label_1d_open).
+"""
+from __future__ import annotations
+
+import argparse
+import concurrent.futures as cf
+import json
+import os
+import re
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable
+
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+os.environ.setdefault("ARROW_NUM_THREADS", "1")
+os.environ.setdefault("POLARS_MAX_THREADS", "1")
+
+import numpy as np
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+PIT_CONTRACT_VERSION = "p2-pit-v2"
+DEFAULT_INTRADAY_HORIZONS = ["5m", "15m", "30m", "60m", "120m"]
+DEFAULT_DAILY_HORIZONS = ["1d_open", "2d_open", "3d_open", "4d_open", "5d_open", "10d_open", "20d_open", "30d_open"]
+DEFAULT_HORIZONS = DEFAULT_INTRADAY_HORIZONS + DEFAULT_DAILY_HORIZONS
+SCORES = [
+    "daily_pressure_score",
+    "daily_underreaction_score",
+    "daily_consensus_score",
+    "late_confirmation_score_z",
+]
+
+
+@dataclass(frozen=True)
+class Part:
+    date: str
+    layer_id: str
+    scale: str
+    base: Path
+
+
+def csvset(value: str | None) -> set[str] | None:
+    return None if not value else {x.strip() for x in str(value).split(",") if x.strip()}
+
+
+def csvlist(value: str | None) -> list[str] | None:
+    return None if not value else [x.strip() for x in str(value).split(",") if x.strip()]
+
+
+def is_intraday_horizon(horizon: str) -> bool:
+    return bool(re.fullmatch(r"\d+m", str(horizon)))
+
+
+def is_daily_open_horizon(horizon: str) -> bool:
+    return bool(re.fullmatch(r"\d+d_open", str(horizon)))
+
+
+def horizon_minutes(horizon: str) -> int:
+    if not is_intraday_horizon(horizon):
+        raise ValueError(f"not an intraday horizon: {horizon}")
+    return int(horizon[:-1])
+
+
+def ext(path: str | Path, key: str) -> str | None:
+    for part in Path(path).parts:
+        if part.startswith(key + "="):
+            return part.split("=", 1)[1]
+    return None
+
+
+def canonical_theme_path(values: pd.Series) -> pd.Series:
+    """Remove only the leading snapshot token; never leave a partial date."""
+    return values.astype(str).str.replace(r"^ts=[^|]+\|", "", regex=True)
+
+
+def parse_theme_ts_series(values: pd.Series) -> pd.Series:
+    token = values.astype(str).str.extract(r"^ts=([^|]+)", expand=False)
+    compact = token.str.extract(r"(\d{4}-\d{2}-\d{2})T(\d{2})(\d{2})(\d{2})", expand=True)
+    parsed = pd.to_datetime(
+        compact[0] + " " + compact[1] + ":" + compact[2] + ":" + compact[3],
+        utc=True,
+        errors="coerce",
+        format="%Y-%m-%d %H:%M:%S",
+    )
+    missing = parsed.isna() & token.notna()
+    if missing.any():
+        parsed.loc[missing] = pd.to_datetime(token[missing], utc=True, errors="coerce", format="mixed")
+    return parsed
+
+
+def label_path(root: str | Path, date: str) -> Path:
+    root = Path(root)
+    candidates = [
+        root if root.is_file() else None,
+        root / f"date={date}" / "labels.parquet",
+        root / "canonical" / f"date={date}" / "labels.parquet",
+        root / date / "labels.parquet",
+    ]
+    for candidate in candidates:
+        if candidate is not None and candidate.exists():
+            return candidate
+    raise FileNotFoundError(f"labels.parquet not found for date={date} under {root}")
+
+
+def discover(
+    root: str | Path,
+    filename: str,
+    dates: set[str] | None = None,
+    layers: set[str] | None = None,
+    scales: set[str] | None = None,
+) -> list[Part]:
+    parts: list[Part] = []
+    for path in Path(root).rglob(filename):
+        date, layer, scale = ext(path, "date"), ext(path, "layer_id"), ext(path, "scale")
+        if not date or not layer or not scale:
+            continue
+        if dates and date not in dates:
+            continue
+        if layers and layer not in layers:
+            continue
+        if scales and scale not in scales:
+            continue
+        parts.append(Part(date, layer, scale, path))
+    parts.sort(key=lambda p: p.base.stat().st_size, reverse=True)
+    return parts
+
+
+def read_partition(path: str | Path, columns: Iterable[str] | None = None, max_row_groups: int | None = None) -> pd.DataFrame:
+    parquet = pq.ParquetFile(path)
+    available = set(parquet.schema.names)
+    selected = None if columns is None else [c for c in columns if c in available]
+    if selected == []:
+        return pd.DataFrame()
+    if max_row_groups is None:
+        return pd.read_parquet(path, columns=selected)
+    tables = [
+        parquet.read_row_group(i, columns=selected)
+        for i in range(min(max_row_groups, parquet.metadata.num_row_groups))
+    ]
+    return pa.concat_tables(tables).to_pandas() if tables else pd.DataFrame()
+
+
+def write_parquet_atomic(frame: pd.DataFrame, path: str | Path) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    if temporary.exists():
+        temporary.unlink()
+    pq.write_table(pa.Table.from_pandas(frame, preserve_index=False), temporary, compression="zstd")
+    temporary.replace(path)
+
+
+def write_manifest(directory: str | Path, payload: dict) -> None:
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    payload = {**payload, "pit_contract_version": PIT_CONTRACT_VERSION}
+    temporary = directory / "manifest.json.tmp"
+    temporary.write_text(json.dumps(payload, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
+    temporary.replace(directory / "manifest.json")
+
+
+def is_complete(manifest_path: str | Path) -> bool:
+    try:
+        payload = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+        return (
+            payload.get("status") == "complete"
+            and int(payload.get("output_rows", 0)) > 0
+            and payload.get("pit_contract_version") == PIT_CONTRACT_VERSION
+        )
+    except Exception:
+        return False
+
+
+def stream_frames(path: str | Path, frames: Iterable[pd.DataFrame | None]) -> tuple[int, int]:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = Path(str(path) + ".tmp")
+    if temporary.exists():
+        temporary.unlink()
+    writer: pq.ParquetWriter | None = None
+    schema: pa.Schema | None = None
+    rows = batches = 0
+    try:
+        for frame in frames:
+            if frame is None or frame.empty:
+                continue
+            table = pa.Table.from_pandas(frame, preserve_index=False)
+            if writer is None:
+                schema = table.schema
+                writer = pq.ParquetWriter(temporary, schema, compression="zstd")
+            elif table.schema != schema:
+                table = table.cast(schema)
+            writer.write_table(table)
+            rows += len(frame)
+            batches += 1
+    finally:
+        if writer is not None:
+            writer.close()
+    if rows:
+        os.replace(temporary, path)
+    elif temporary.exists():
+        temporary.unlink()
+    return rows, batches
+
+
+def zscore_by_group(frame: pd.DataFrame, group_columns: list[str], column: str) -> pd.Series:
+    def transform(series: pd.Series) -> pd.Series:
+        numeric = pd.to_numeric(series, errors="coerce")
+        std = numeric.std(ddof=0)
+        if not np.isfinite(std) or std == 0:
+            return pd.Series(0.0, index=series.index)
+        return (numeric - numeric.mean()) / std
+
+    return frame.groupby(group_columns, sort=False, dropna=False)[column].transform(transform)
+
+
+def load_labels(path: str | Path, horizons: list[str]) -> pd.DataFrame:
+    """Load targets and construct only fully-realized past intraday returns."""
+    parquet = pq.ParquetFile(path)
+    names = set(parquet.schema.names)
+    valid = [h for h in horizons if f"label_{h}" in names]
+    if not valid:
+        raise ValueError(f"no requested label columns in {path}; requested={horizons}")
+
+    columns = ["decision_time", "symbol_id"]
+    if "label_entry_time" in names:
+        columns.append("label_entry_time")
+    for horizon in valid:
+        columns.append(f"label_{horizon}")
+        for candidate in (
+            f"label_entry_time_{horizon}",
+            f"label_exit_time_{horizon}",
+            f"label_entry_date_{horizon}",
+            f"label_exit_date_{horizon}",
+        ):
+            if candidate in names:
+                columns.append(candidate)
+    columns = list(dict.fromkeys(columns))
+    frame = pd.read_parquet(path, columns=columns)
+    frame["decision_time"] = pd.to_datetime(frame["decision_time"], utc=True, errors="coerce")
+    frame["symbol_id"] = pd.to_numeric(frame["symbol_id"], errors="coerce").astype("Int64")
+    frame = frame.dropna(subset=["decision_time", "symbol_id"]).copy()
+    frame["symbol_id"] = frame["symbol_id"].astype("int64")
+    if "label_entry_time" in frame:
+        frame["label_entry_time"] = pd.to_datetime(frame["label_entry_time"], utc=True, errors="coerce")
+
+    for horizon in valid:
+        if not is_intraday_horizon(horizon):
+            continue
+        target = f"label_{horizon}"
+        exit_column = f"label_exit_time_{horizon}"
+        if exit_column not in frame:
+            raise ValueError(
+                f"{exit_column} is required for PIT-safe past_{horizon}; "
+                "refusing to infer availability from the nominal horizon"
+            )
+        frame[exit_column] = pd.to_datetime(frame[exit_column], utc=True, errors="coerce")
+        entry_column = f"label_entry_time_{horizon}" if f"label_entry_time_{horizon}" in frame else "label_entry_time"
+        if entry_column in frame:
+            frame[entry_column] = pd.to_datetime(frame[entry_column], utc=True, errors="coerce")
+
+        past_columns = ["symbol_id", "decision_time", target, exit_column]
+        if entry_column in frame:
+            past_columns.append(entry_column)
+        past = frame[past_columns].copy()
+        rename = {
+            "decision_time": f"past_source_decision_time_{horizon}",
+            target: f"past_label_{horizon}",
+            exit_column: "decision_time",
+        }
+        if entry_column in past:
+            rename[entry_column] = f"past_entry_time_{horizon}"
+        past = past.rename(columns=rename)
+        past[f"past_exit_time_{horizon}"] = past["decision_time"]
+        frame = frame.merge(past, on=["decision_time", "symbol_id"], how="left", validate="many_to_one")
+        available = frame[f"past_exit_time_{horizon}"].notna()
+        if available.any() and not (frame.loc[available, f"past_exit_time_{horizon}"] <= frame.loc[available, "decision_time"]).all():
+            raise AssertionError(f"past_label_{horizon} contains a value unavailable at decision_time")
+
+    return frame
