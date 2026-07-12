@@ -17,12 +17,16 @@ HORIZONS=['5m','15m','30m','60m','120m']
 class Part: date:str; layer_id:str; scale:str; base:Path
 
 def csvset(s): return None if not s else {x.strip() for x in str(s).split(',') if x.strip()}
-def csvlist(s): return None if not s else [x.strip() for x in str(s).split(',') if x.strip()}
+def csvlist(s): return None if not s else [x.strip() for x in str(s).split(',') if x.strip()]
 def mins(h): return int(str(h)[:-1]) if str(h).endswith('m') else (_ for _ in ()).throw(ValueError(h))
 def ext(p,k):
     for x in Path(p).parts:
         if x.startswith(k+'='): return x.split('=',1)[1]
     return None
+def write_parquet_atomic(df, path):
+    path=Path(path); path.parent.mkdir(parents=True,exist_ok=True); tmp=path.with_suffix(path.suffix+'.tmp')
+    if tmp.exists(): tmp.unlink()
+    pq.write_table(pa.Table.from_pandas(df,preserve_index=False), tmp, compression='zstd'); tmp.replace(path)
 def done(m):
     try:
         j=json.loads(Path(m).read_text(encoding='utf-8')); return j.get('status')=='complete' and int(j.get('output_rows',0))>0
@@ -48,7 +52,7 @@ def discover(root, filename='edges.parquet', dates=None, layers=None, scales=Non
         if scales and s not in scales and s!='default': continue
         out.append(Part(d,l,s,p))
     out.sort(key=lambda x:x.base.stat().st_size, reverse=True); return out
-def read_table(path, cols=None): return pq.read_table(path, columns=cols).to_pandas()
+def read_table(path, cols=None): return pq.ParquetFile(path).read(columns=cols).to_pandas()
 def stream_df(path, frames):
     path=Path(path); path.parent.mkdir(parents=True,exist_ok=True); tmp=Path(str(path)+'.tmp')
     if tmp.exists(): tmp.unlink()
@@ -141,19 +145,24 @@ def p0_graph_state_one(part,out_root,skip,max_rg):
             nodes=pd.unique(pd.concat([g.src_id,g.dst_id],ignore_index=True)); rows.append({'decision_time':keys[0],'layer_id':keys[1],'scale':keys[2],'edge_count':len(g),'active_node_count':len(nodes),'avg_abs_weight':float(g.abs_weight.mean()),'sum_abs_weight':float(g.abs_weight.sum()),'max_abs_weight':float(g.abs_weight.max()),'density_proxy':float(len(g)/max(len(nodes),1))})
     df=pd.DataFrame(rows); write_parquet_atomic(df,op) if not df.empty else None; meta={'stage':'p0_graph_state','status':'complete' if len(df) else 'empty','date':part.date,'layer_id':part.layer_id,'scale':part.scale,'output_rows':int(len(df)),'input':str(part.base),'output':str(op),'row_groups':int(nrg),'elapsed_sec':round(time.time()-t,3)}; manifest(out,meta); return meta
 
-def eval_p0(root,out_dir):
+def eval_p0_one(p):
+    df=read_table(p); date=ext(p,'date') or 'unknown'; kind='edge' if 'edge_spillover' in p.name else 'node'
+    targets=[c for c in df.columns if c.startswith('label_') or c.startswith('target_')]
+    feats=[c for c in df.columns if c.startswith('p0_') and pd.api.types.is_numeric_dtype(df[c])]
+    rows=[]
+    for keys,sub in df.groupby(['layer_id','scale'],dropna=False,sort=False):
+        for f in feats:
+            for ta in targets:
+                v=sub[[f,ta]].replace([np.inf,-np.inf],np.nan).dropna()
+                if len(v)<30: continue
+                q8,q2=v[f].quantile(.8),v[f].quantile(.2); rows.append({'date':date,'kind':kind,'layer_id':keys[0],'scale':keys[1],'feature':f,'target':ta,'sample_count':len(v),'rank_ic':v[f].rank().corr(v[ta].rank()),'top_minus_bottom':v[v[f]>=q8][ta].mean()-v[v[f]<=q2][ta].mean(),'source':str(p)})
+    return rows
+
+def eval_p0(root,out_dir,workers=24):
     t=time.time(); files=list(Path(root).rglob('p0_node_features.parquet'))+list(Path(root).rglob('p0_edge_spillover_features.parquet'))
-    out=Path(out_dir); out.mkdir(parents=True,exist_ok=True); rows=[]
-    for p in files:
-        df=read_table(p); date=ext(p,'date') or 'unknown'; kind='edge' if 'edge_spillover' in p.name else 'node'
-        targets=[c for c in df.columns if c.startswith('label_') or c.startswith('target_')]
-        feats=[c for c in df.columns if c.startswith('p0_') and pd.api.types.is_numeric_dtype(df[c])]
-        for keys,sub in df.groupby(['layer_id','scale'],dropna=False,sort=False):
-            for f in feats:
-                for ta in targets:
-                    v=sub[[f,ta]].replace([np.inf,-np.inf],np.nan).dropna()
-                    if len(v)<30: continue
-                    q8,q2=v[f].quantile(.8),v[f].quantile(.2); rows.append({'date':date,'kind':kind,'layer_id':keys[0],'scale':keys[1],'feature':f,'target':ta,'sample_count':len(v),'rank_ic':v[f].rank().corr(v[ta].rank()),'top_minus_bottom':v[v[f]>=q8][ta].mean()-v[v[f]<=q2][ta].mean(),'source':str(p)})
+    out=Path(out_dir); out.mkdir(parents=True,exist_ok=True)
+    res = pool(files, workers, eval_p0_one)
+    rows = [r for sublist in res for r in sublist]
     m=pd.DataFrame(rows); mp=out/'p0_alpha_metrics.csv'; sp=out/'p0_alpha_summary.csv'; m.to_csv(mp,index=False)
     s=m.groupby(['kind','feature','target','layer_id','scale'],sort=False).agg(days=('date','nunique'),sample_count=('sample_count','sum'),mean_rank_ic=('rank_ic','mean'),mean_spread=('top_minus_bottom','mean'),positive_day_rate=('top_minus_bottom',lambda x:float((x>0).mean()))).reset_index() if not m.empty else pd.DataFrame(); s.to_csv(sp,index=False)
     meta={'stage':'p0_alpha_eval','status':'complete' if len(m) else 'empty','input_files':len(files),'metric_rows':int(len(m)),'summary_rows':int(len(s)),'metrics':str(mp),'summary':str(sp),'elapsed_sec':round(time.time()-t,3)}; manifest(out,meta); return meta

@@ -55,7 +55,7 @@ def parse_theme_ts_series(s:pd.Series)->pd.Series:
     if miss.any():
         x=tok[miss].str.extract(r'(\d{4}-\d{2}-\d{2})T(\d{2})(\d{2})(\d{2})', expand=True)
         val=pd.to_datetime(x[0]+' '+x[1]+':'+x[2]+':'+x[3], utc=True, errors='coerce')
-        direct.loc[miss]=val.values
+        direct.loc[miss]=val
     return direct
 
 def load_labels(path,horizons):
@@ -117,7 +117,7 @@ def build_returns_one(part, labels_root, out_root, horizons, levels, skip, max_r
             res=g[alpha].mean(); res.columns=[c.replace('past_label_','past_eq_') if c.startswith('past_label_') else c.replace('label_','ret_eq_') for c in res.columns]
             w=g['core_score'].sum().replace(0,np.nan)
             for c in alpha:
-                wc=df[c]*df['core_score']; res[c.replace('past_label_','past_core_') if c.startswith('past_label_') else c.replace('label_','ret_core_')]=wc.groupby([df[col] for col in gcols],sort=False).sum()/w
+                wc=df[c]*df['core_score']; res[c.replace('past_label_','past_core_') if c.startswith('past_label_') else c.replace('label_','ret_core_')]=wc.groupby(g._grouper).sum()/w
             top5=g.head(5).groupby(gcols,sort=False)[alpha].mean(); top5.columns=[c.replace('past_label_','past_top5_') if c.startswith('past_label_') else c.replace('label_','ret_top5_') for c in top5.columns]
             return res.join(top5).reset_index()
         groups=list(mem.groupby('decision_time', sort=False, dropna=False))
@@ -137,6 +137,7 @@ def relation_one(part, returns_root, out_root, horizons, past_h, levels, tiers, 
     if not rp.exists(): return {'stage':'relation_spillover','status':'missing_theme_returns','date':part.date,'layer_id':part.layer_id,'scale':part.scale}
     r=pd.read_parquet(rp); r['decision_time']=pd.to_datetime(r['decision_time'],utc=True); pc=f'past_eq_{past_h}'
     if pc not in r: raise ValueError(f'missing {pc} in {rp}')
+    r['layer_id'] = r['layer_id'].astype(str); r['scale'] = r['scale'].astype(str)
     targets=[f'ret_eq_{h}' for h in horizons if f'ret_eq_{h}' in r]
     past=r[['decision_time','layer_id','scale','level','theme_id',pc]].rename(columns={'theme_id':'src_theme_id',pc:'src_past_return'})
     fut=r[['decision_time','layer_id','scale','level','theme_id']+targets].rename(columns={'theme_id':'dst_theme_id',**{c:c.replace('ret_eq_','target_') for c in targets}})
@@ -150,6 +151,7 @@ def relation_one(part, returns_root, out_root, horizons, past_h, levels, tiers, 
         if tiers and 'relation_tier' in e: e=e[e['relation_tier'].astype(str).isin(tiers)]
         if 'layer_id' not in e: e['layer_id']=part.layer_id
         if 'scale' not in e: e['scale']=part.scale
+        e['layer_id'] = e['layer_id'].astype(str); e['scale'] = e['scale'].astype(str)
         def one(item):
             dt,pcu=item; ecu=e[e['decision_time'].eq(dt)]
             if ecu.empty: return None
