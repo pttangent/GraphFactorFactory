@@ -192,8 +192,10 @@ def main() -> None:
         stage = plan["intraday-relation-features"]
         run_command([python, args.p2_script, "intraday-relation-features", "--signals-root", str(root / "relation_spillover"), "--out-root", str(root / "intraday_relation_features"), "--workers", str(stage.workers), "--underreaction-past-horizon", args.underreaction_past_horizon] + common, environment, args.dry_run)
     if args.stage in {"all", "daily"}:
+        if not args.p1_root:
+            raise SystemExit("--p1-root required for daily temporal episode identity")
         stage = plan["daily-relation-features"]
-        run_command([python, args.p2_script, "daily-relation-features", "--signals-root", str(root / "relation_spillover"), "--out-root", str(root / "daily_relation_features"), "--workers", str(stage.workers), "--late-minutes", str(args.late_minutes), "--underreaction-past-horizon", args.underreaction_past_horizon] + common, environment, args.dry_run)
+        run_command([python, args.p2_script, "daily-relation-features", "--signals-root", str(root / "relation_spillover"), "--p1-root", args.p1_root, "--out-root", str(root / "daily_relation_features"), "--workers", str(stage.workers), "--late-minutes", str(args.late_minutes), "--underreaction-past-horizon", args.underreaction_past_horizon] + common, environment, args.dry_run)
     if args.stage in {"all", "eval", "intraday-eval"}:
         run_command([python, args.p2_script, "evaluate-intraday", "--features-root", str(root / "intraday_relation_features"), "--out-dir", str(root / "intraday_relation_eval")], environment, args.dry_run)
     if args.stage in {"all", "eval", "daily-eval"}:
