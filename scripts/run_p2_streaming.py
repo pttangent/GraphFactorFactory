@@ -45,6 +45,54 @@ def pull_month(month: str):
             robocopy_dir(p1_dir, LOCAL_P1 / p1_dir.name)
             
     print(f"[{time.strftime('%H:%M:%S')}] [PRODUCER] Finished pre-fetching {month}")
+    inject_daily_labels(month)
+
+def inject_daily_labels(month: str):
+    import pandas as pd
+    print(f"[{time.strftime('%H:%M:%S')}] [PRODUCER] Injecting daily labels into {month}...")
+    
+    mapping_path = Path(r"D:\DEV\US-Stock\GraphFactorFactory\artifacts\global_symbol_mapping.parquet")
+    labels_path = Path(r"D:\DEV\US-Stock\RAW_DATA\1d\daily_labels_2026.parquet")
+    if not mapping_path.exists() or not labels_path.exists():
+        print(f"[WARNING] Mapping or daily labels missing, cannot inject for {month}")
+        return
+        
+    mapping = pd.read_parquet(mapping_path)
+    daily = pd.read_parquet(labels_path)
+    
+    daily = daily.merge(mapping, left_on="stable_symbol_id", right_on="symbol", how="inner")
+    
+    ret_cols = [c for c in daily.columns if "close_return" in c or c == "close_to_next_close"]
+    rename_dict = {}
+    for c in ret_cols:
+        if c == "close_to_next_close":
+            rename_dict[c] = "label_1d"
+        elif "close_return" in c:
+            n = c.split("_")[0][1:]
+            rename_dict[c] = f"label_{n}d"
+            
+    daily = daily.rename(columns=rename_dict)
+    cols_to_merge = ["date", "symbol_id"] + list(rename_dict.values())
+    daily = daily[cols_to_merge]
+    
+    for p0_dir in LOCAL_P0.glob(f"date={month}-*"):
+        label_file = p0_dir / "labels.parquet"
+        if not label_file.exists(): continue
+        
+        p0_lbl = pd.read_parquet(label_file)
+        date_str = p0_dir.name.split("=")[1]
+        daily_for_date = daily[daily["date"] == date_str].copy()
+        if daily_for_date.empty: continue
+            
+        daily_for_date = daily_for_date.drop(columns=["date"])
+        merged = p0_lbl.merge(daily_for_date, on="symbol_id", how="left")
+        
+        for c in rename_dict.values():
+            if c in merged.columns:
+                merged[c] = merged[c].astype("float32")
+                
+        merged.to_parquet(label_file, index=False)
+    print(f"[{time.strftime('%H:%M:%S')}] [PRODUCER] Finished injecting labels for {month}")
 
 def run_p2_month(month: str):
     print(f"[{time.strftime('%H:%M:%S')}] [CONSUMER] Starting 24-core P2 pipeline for {month}...")
@@ -65,6 +113,7 @@ def run_p2_month(month: str):
         "--dates", dates_str,
         "--layers", "3,6,8,9,11",
         "--scales", "15m,30m",
+        "--horizons", "5m,15m,30m,60m,120m,1d,2d,3d,4d,5d,10d,20d,30d",
         "--profile", "max",
         "--cores", "24",
         "--target-cpu", "1.0",
@@ -72,12 +121,22 @@ def run_p2_month(month: str):
         "--skip-existing"
     ]
     
+    # Run pipeline as usual
     env = os.environ.copy()
     r = subprocess.run(cmd, env=env, stdout=sys.stdout, stderr=sys.stderr)
     if r.returncode != 0:
         print(f"[ERROR] Pipeline failed for {month}!")
         raise SystemExit(1)
         
+    # NEW: Run evaluate-daily separately to isolate monthly CSVs
+    print(f"[{time.strftime('%H:%M:%S')}] [CONSUMER] Running isolated evaluate-daily for {month}...")
+    eval_cmd = [
+        sys.executable, "scripts/p2_alpha_daily_features.py", "evaluate-daily", 
+        "--features-root", str(LOCAL_P2_OUT / "daily_relation_features"),
+        "--out-dir", str(LOCAL_P2_OUT / f"daily_relation_eval_{month}")
+    ]
+    subprocess.run(eval_cmd, env=env)
+    
     print(f"[{time.strftime('%H:%M:%S')}] [CONSUMER] P2 Pipeline finished for {month}.")
         
     print(f"[{time.strftime('%H:%M:%S')}] [CONSUMER] Cleaning up local inputs for {month}...")

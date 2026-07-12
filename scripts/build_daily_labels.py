@@ -16,16 +16,37 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+import pyzipper
+import hashlib
+import io
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 LOG = logging.getLogger("build_daily_labels")
 
 
+def generate_zip_password(filename):
+    SALT = "vvtr123!@#qwe"
+    data_to_hash = f"{filename}{SALT}".encode('utf-8')
+    return hashlib.sha256(data_to_hash).hexdigest().encode('utf-8')
+
+
 def read_parquet_input(path: Path) -> pd.DataFrame:
     if path.is_dir():
+        zips = sorted(path.rglob("*.zip"))
+        if zips:
+            dfs = []
+            for z_path in zips:
+                pwd = generate_zip_password(z_path.name)
+                with pyzipper.AESZipFile(z_path) as z:
+                    csv_name = z.namelist()[0]
+                    with z.open(csv_name, pwd=pwd) as f:
+                        dfs.append(pd.read_csv(f))
+            LOG.info("Loaded %d encrypted zip files from %s", len(dfs), path)
+            return pd.concat(dfs, ignore_index=True)
+
         files = sorted(path.rglob("*.parquet"))
         if not files:
-            raise FileNotFoundError(f"No parquet files under {path}")
+            raise FileNotFoundError(f"No parquet or zip files under {path}")
         LOG.info("Loading %d parquet files from %s", len(files), path)
         return pd.concat((pd.read_parquet(f) for f in files), ignore_index=True)
     LOG.info("Loading parquet file %s", path)
@@ -52,12 +73,13 @@ def build_daily_labels(
     ensure_columns(prices_df, required)
 
     df = prices_df.copy()
-    df[date_col] = pd.to_datetime(df[date_col]).dt.date
+    df[date_col] = pd.to_datetime(df[date_col], utc=True).dt.date
     df[open_col] = pd.to_numeric(df[open_col], errors="coerce")
     df[close_col] = pd.to_numeric(df[close_col], errors="coerce")
     df = df.dropna(subset=[date_col, stable_id_col, open_col, close_col]).copy()
     df = df[(df[open_col] > 0) & (df[close_col] > 0)].copy()
 
+    df = df.drop_duplicates(subset=[date_col, stable_id_col], keep="last").copy()
     dup = int(df.duplicated([date_col, stable_id_col]).sum())
     if dup > 0:
         raise ValueError(
@@ -69,22 +91,16 @@ def build_daily_labels(
     group = df.groupby(stable_id_col, sort=False)
 
     df["next_trade_date"] = group[date_col].shift(-1)
-    df["t3_trade_date"] = group[date_col].shift(-3)
-    df["t5_trade_date"] = group[date_col].shift(-5)
     df["next_open"] = group[open_col].shift(-1)
     df["next_close"] = group[close_col].shift(-1)
-    df["t3_close"] = group[close_col].shift(-3)
-    df["t5_close"] = group[close_col].shift(-5)
 
     df["close_t"] = df[close_col]
     df["open_t"] = df[open_col]
     df["close_to_next_open"] = df["next_open"] / df["close_t"] - 1.0
     df["next_open_to_close"] = df["next_close"] / df["next_open"] - 1.0
     df["close_to_next_close"] = df["next_close"] / df["close_t"] - 1.0
-    df["t3_close_return"] = df["t3_close"] / df["close_t"] - 1.0
-    df["t5_close_return"] = df["t5_close"] / df["close_t"] - 1.0
 
-    out = pd.DataFrame({
+    out_data = {
         "date": pd.to_datetime(df[date_col]).dt.strftime("%Y-%m-%d"),
         "stable_symbol_id": df[stable_id_col].astype(str),
         "open_t": df["open_t"],
@@ -95,11 +111,21 @@ def build_daily_labels(
         "close_to_next_open": df["close_to_next_open"],
         "next_open_to_close": df["next_open_to_close"],
         "close_to_next_close": df["close_to_next_close"],
-        "t3_trade_date": pd.to_datetime(df["t3_trade_date"]).dt.strftime("%Y-%m-%d"),
-        "t3_close_return": df["t3_close_return"],
-        "t5_trade_date": pd.to_datetime(df["t5_trade_date"]).dt.strftime("%Y-%m-%d"),
-        "t5_close_return": df["t5_close_return"],
-    })
+    }
+
+    max_n = df.groupby(stable_id_col, sort=False).size().max()
+    for n in range(2, max_n):
+        df[f"t{n}_trade_date"] = group[date_col].shift(-n)
+        df[f"t{n}_close"] = group[close_col].shift(-n)
+        df[f"t{n}_open"] = group[open_col].shift(-n)
+        df[f"t{n}_close_return"] = df[f"t{n}_close"] / df["close_t"] - 1.0
+        df[f"t{n}_open_return"] = df[f"t{n}_open"] / df["close_t"] - 1.0
+        
+        out_data[f"t{n}_trade_date"] = pd.to_datetime(df[f"t{n}_trade_date"]).dt.strftime("%Y-%m-%d")
+        out_data[f"t{n}_close_return"] = df[f"t{n}_close_return"]
+        out_data[f"t{n}_open_return"] = df[f"t{n}_open_return"]
+
+    out = pd.DataFrame(out_data)
     if symbol_col:
         out.insert(2, "symbol", df[symbol_col].astype(str).values)
 
@@ -132,13 +158,7 @@ def make_mock_prices() -> pd.DataFrame:
 
 
 def validate_labels(labels: pd.DataFrame, max_abs_return: float, allow_extreme_returns: bool) -> dict[str, Any]:
-    ret_cols = [
-        "close_to_next_open",
-        "next_open_to_close",
-        "close_to_next_close",
-        "t3_close_return",
-        "t5_close_return",
-    ]
+    ret_cols = [c for c in labels.columns if "return" in c or c in ["close_to_next_open", "next_open_to_close", "close_to_next_close"]]
     report: dict[str, Any] = {
         "rows": int(len(labels)),
         "dates": int(labels["date"].nunique()) if "date" in labels else 0,
