@@ -58,7 +58,7 @@ def main():
     ap.add_argument('--p0-root'); ap.add_argument('--p1-root'); ap.add_argument('--labels-root',required=True); ap.add_argument('--p2-root',required=True)
     ap.add_argument('--p2-script',default='scripts/p2_alpha_daily_features.py'); ap.add_argument('--p0-script',default='scripts/p2_p0_graph_alpha.py')
     ap.add_argument('--dates'); ap.add_argument('--layers',default='3,6,8,9,11'); ap.add_argument('--scales',default='15m,30m'); ap.add_argument('--levels',default='B50,B35'); ap.add_argument('--horizons',default='5m,15m,30m,60m,120m')
-    ap.add_argument('--past-horizon',default='15m'); ap.add_argument('--tiers')
+    ap.add_argument('--past-horizon',default='15m'); ap.add_argument('--underreaction-past-horizon',default='15m'); ap.add_argument('--tiers')
     ap.add_argument('--cores',type=int,default=24); ap.add_argument('--target-cpu',type=float,default=1.0); ap.add_argument('--inner-workers',type=int,default=1)
     ap.add_argument('--profile',choices=['safe','balanced','aggressive','max'],default='max')
     ap.add_argument('--stage',choices=['all','p0','p0-node','p0-edge','p0-graph','p0-eval','theme','relation','daily','eval'],default='all')
@@ -67,7 +67,7 @@ def main():
     if not (0<args.target_cpu<=1.5): raise SystemExit('--target-cpu must be in (0, 1.5]')
     if args.inner_workers<1: raise SystemExit('--inner-workers must be >=1')
     p2_root=Path(args.p2_root); p2_root.mkdir(parents=True,exist_ok=True); plan=build_plan(args.cores,args.target_cpu,args.profile,args.inner_workers)
-    payload={'profile':args.profile,'cores':args.cores,'target_cpu':args.target_cpu,'inner_workers':args.inner_workers,'target_slots':int(math.ceil(args.cores*args.target_cpu)),'stage_plan':{k:asdict(v) for k,v in plan.items()},'filters':{'dates':args.dates,'layers':args.layers,'scales':args.scales,'levels':args.levels,'horizons':args.horizons},'created_at_epoch':time.time()}
+    payload={'profile':args.profile,'cores':args.cores,'target_cpu':args.target_cpu,'inner_workers':args.inner_workers,'target_slots':int(math.ceil(args.cores*args.target_cpu)),'stage_plan':{k:asdict(v) for k,v in plan.items()},'filters':{'dates':args.dates,'layers':args.layers,'scales':args.scales,'levels':args.levels,'horizons':args.horizons,'past_horizon':args.past_horizon,'underreaction_past_horizon':args.underreaction_past_horizon},'created_at_epoch':time.time()}
     (p2_root/'p2_24core_schedule_plan.json').write_text(json.dumps(payload,indent=2,ensure_ascii=False),encoding='utf-8'); print(json.dumps(payload,indent=2,ensure_ascii=False),flush=True)
     env=os.environ.copy(); env.update(THREAD_CAPS); py=sys.executable; p2=args.p2_script; p0=args.p0_script; cfilt=common(args); p0f=common_p0(args)
     if args.stage in ('all','p0','p0-node'):
@@ -88,7 +88,7 @@ def main():
         if not args.p1_root: raise SystemExit('--p1-root required for P1 relation stages')
         s=plan['relation-spillover']; cmd=[py,p2,'relation-spillover','--p1-root',args.p1_root,'--theme-returns-root',str(p2_root/'theme_returns'),'--out-root',str(p2_root/'relation_spillover'),'--past-horizon',args.past_horizon,'--workers',str(s.workers),'--inner-workers',str(s.inner_workers)]+cfilt; cmd+=csv_arg('--tiers',args.tiers); run_cmd(cmd,env,args.dry_run)
     if args.stage in ('all','daily'):
-        s=plan['daily-relation-features']; run_cmd([py,p2,'daily-relation-features','--signals-root',str(p2_root/'relation_spillover'),'--out-root',str(p2_root/'daily_relation_features'),'--workers',str(s.workers)]+cfilt,env,args.dry_run)
+        s=plan['daily-relation-features']; run_cmd([py,p2,'daily-relation-features','--signals-root',str(p2_root/'relation_spillover'),'--out-root',str(p2_root/'daily_relation_features'),'--workers',str(s.workers),'--underreaction-past-horizon',args.underreaction_past_horizon]+cfilt,env,args.dry_run)
     if args.stage in ('all','eval'):
         run_cmd([py,p2,'evaluate-daily','--features-root',str(p2_root/'daily_relation_features'),'--out-dir',str(p2_root/'daily_relation_eval')],env,args.dry_run)
 if __name__=='__main__': main()
