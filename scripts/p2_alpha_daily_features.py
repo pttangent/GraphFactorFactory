@@ -59,24 +59,30 @@ def build_returns_one(part, labels_root, out_root, horizons, levels, skip, max_r
     t=time.time(); out=Path(out_root)/f'date={part.date}'/f'layer_id={part.layer_id}'/f'scale={part.scale}'; op=out/'theme_returns.parquet'
     if skip and done(out/'manifest.json'): return {'stage':'theme_returns','status':'skipped','date':part.date,'layer_id':part.layer_id,'scale':part.scale}
     lab=load_labels(label_path(labels_root,part.date),horizons); alpha=[c for c in lab.columns if c.startswith('label_') or c.startswith('past_label_')]
-    mem=read_partition(part.base,['decision_time','layer_id','scale','level','theme_id','member_id','core_score','rank_in_theme'],max_rg)
+    mem=read_partition(part.base,['layer_id','scale','level','theme_id','member_id','core_score','rank_in_theme'],max_rg)
     if mem.empty: rows=0
     else:
-        mem['decision_time']=pd.to_datetime(mem['decision_time'],utc=True); mem['member_id']=pd.to_numeric(mem['member_id'],errors='coerce').astype('Int64'); mem['core_score']=pd.to_numeric(mem.get('core_score',0),errors='coerce').fillna(0.0); mem=mem.dropna(subset=['member_id','theme_id']).copy(); mem['member_id']=mem['member_id'].astype('int64')
+        mem['member_id']=pd.to_numeric(mem['member_id'],errors='coerce').astype('Int64'); mem['core_score']=pd.to_numeric(mem.get('core_score',0),errors='coerce').fillna(0.0); mem=mem.dropna(subset=['member_id','theme_id']).copy(); mem['member_id']=mem['member_id'].astype('int64')
         if 'level' not in mem: mem['level']='UNKNOWN'
         if levels: mem=mem[mem['level'].astype(str).isin(levels)]
         if 'layer_id' not in mem: mem['layer_id']=part.layer_id
         if 'scale' not in mem: mem['scale']=part.scale
-        df=mem.merge(lab,left_on=['decision_time','member_id'],right_on=['decision_time','symbol_id'],how='inner')
-        if df.empty: rows=0
-        else:
+        def _process_chunk(dt, lab_chunk):
+            df=mem.merge(lab_chunk,left_on=['member_id'],right_on=['symbol_id'],how='inner')
+            if df.empty: return None
             gcols=['decision_time','layer_id','scale','level','theme_id']; df=df.sort_values(gcols+['core_score'],ascending=[1,1,1,1,1,0]); g=df.groupby(gcols,sort=False)
             res=g[alpha].mean(); res.columns=[c.replace('past_label_','past_eq_') if c.startswith('past_label_') else c.replace('label_','ret_eq_') for c in res.columns]
             w=g['core_score'].sum().replace(0,np.nan)
             for c in alpha:
                 wc='w_'+c; df[wc]=df[c]*df['core_score']; res[c.replace('past_label_','past_core_') if c.startswith('past_label_') else c.replace('label_','ret_core_')]=g[wc].sum()/w
             top5=g.head(5).groupby(gcols,sort=False)[alpha].mean(); top5.columns=[c.replace('past_label_','past_top5_') if c.startswith('past_label_') else c.replace('label_','ret_top5_') for c in top5.columns]
-            odf=res.join(top5).reset_index(); write_parquet_atomic(odf,op); rows=len(odf)
+            return res.join(top5).reset_index()
+        with cf.ThreadPoolExecutor(max_workers=8) as ex:
+            futs = [ex.submit(_process_chunk, dt, chunk) for dt, chunk in lab.groupby('decision_time', dropna=False, sort=False)]
+            res_list = [f.result() for f in futs if f.result() is not None]
+        if not res_list: rows=0
+        else:
+            final_df=pd.concat(res_list, ignore_index=True); write_parquet_atomic(final_df,op); rows=len(final_df)
     meta={'stage':'theme_returns','status':'complete' if rows else 'empty','date':part.date,'layer_id':part.layer_id,'scale':part.scale,'output_rows':int(rows),'input':str(part.base),'output':str(op),'elapsed_sec':round(time.time()-t,3)}; manifest(out,meta); return meta
 
 def relation_one(part, returns_root, out_root, horizons, past_h, levels, tiers, skip, max_rg):
@@ -88,22 +94,27 @@ def relation_one(part, returns_root, out_root, horizons, past_h, levels, tiers, 
     targets=[f'ret_eq_{h}' for h in horizons if f'ret_eq_{h}' in r]
     past=r[['decision_time','layer_id','scale','level','theme_id',pc]].rename(columns={'theme_id':'src_theme_id',pc:'src_past_return'})
     fut=r[['decision_time','layer_id','scale','level','theme_id']+targets].rename(columns={'theme_id':'dst_theme_id',**{c:c.replace('ret_eq_','target_') for c in targets}})
-    e=read_partition(part.base,['decision_time','layer_id','scale','level','src_theme_id','dst_theme_id','relation_strength','relation_tier','hard_keep','edge_count'],max_rg)
+    e=read_partition(part.base,['layer_id','scale','level','src_theme_id','dst_theme_id','relation_strength','relation_tier','hard_keep','edge_count'],max_rg)
     if e.empty: rows=0
     else:
-        e['decision_time']=pd.to_datetime(e['decision_time'],utc=True)
         if levels and 'level' in e: e=e[e['level'].astype(str).isin(levels)]
         if tiers and 'relation_tier' in e: e=e[e['relation_tier'].astype(str).isin(tiers)]
         if 'layer_id' not in e: e['layer_id']=part.layer_id
         if 'scale' not in e: e['scale']=part.scale
-        m=e.merge(past,on=['decision_time','layer_id','scale','level','src_theme_id'],how='inner')
-        if m.empty: rows=0
-        else:
+        def _process_rel_chunk(dt, past_chunk):
+            m=e.merge(past_chunk,on=['layer_id','scale','level','src_theme_id'],how='inner')
+            if m.empty: return None
             m['signal']=pd.to_numeric(m['relation_strength'],errors='coerce').fillna(0)*pd.to_numeric(m['src_past_return'],errors='coerce').fillna(0)
             a=m.groupby(['decision_time','layer_id','scale','level','dst_theme_id'],sort=False).agg(signal=('signal','mean'),relation_strength_mean=('relation_strength','mean'),relation_edge_count=('src_theme_id','size')).reset_index()
-            z=a.merge(fut,on=['decision_time','layer_id','scale','level','dst_theme_id'],how='inner')
-            if z.empty: rows=0
-            else: z.insert(0,'alpha_name','relation_spillover'); z.insert(1,'date',part.date); write_parquet_atomic(z,op); rows=len(z)
+            fut_chunk = fut[fut['decision_time'] == dt]
+            z=a.merge(fut_chunk,on=['decision_time','layer_id','scale','level','dst_theme_id'],how='inner')
+            return z if not z.empty else None
+        with cf.ThreadPoolExecutor(max_workers=8) as ex:
+            futs = [ex.submit(_process_rel_chunk, dt, chunk) for dt, chunk in past.groupby('decision_time', dropna=False, sort=False)]
+            res_list = [f.result() for f in futs if f.result() is not None]
+        if not res_list: rows=0
+        else:
+            final_df=pd.concat(res_list, ignore_index=True); final_df.insert(1,'date',part.date); write_parquet_atomic(final_df,op); rows=len(final_df)
     meta={'stage':'relation_spillover','status':'complete' if rows else 'empty','date':part.date,'layer_id':part.layer_id,'scale':part.scale,'output_rows':int(rows),'input':str(part.base),'theme_returns':str(rp),'output':str(op),'elapsed_sec':round(time.time()-t,3)}; manifest(out,meta); return meta
 
 def path_id(s): return s.astype(str).str.replace(r'([.|_\-])?ts=[^.|_\-]+','',regex=True).str.replace(r'([.|_\-])?time=[^.|_\-]+','',regex=True)
