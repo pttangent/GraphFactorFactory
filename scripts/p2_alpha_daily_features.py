@@ -74,15 +74,26 @@ def build_returns_one(part, labels_root, out_root, horizons, levels, skip, max_r
             res=g[alpha].mean(); res.columns=[c.replace('past_label_','past_eq_') if c.startswith('past_label_') else c.replace('label_','ret_eq_') for c in res.columns]
             w=g['core_score'].sum().replace(0,np.nan)
             for c in alpha:
-                wc='w_'+c; df[wc]=df[c]*df['core_score']; res[c.replace('past_label_','past_core_') if c.startswith('past_label_') else c.replace('label_','ret_core_')]=g[wc].sum()/w
+                wc = df[c]*df['core_score']
+                res[c.replace('past_label_','past_core_') if c.startswith('past_label_') else c.replace('label_','ret_core_')]=wc.groupby([df[col] for col in gcols],sort=False).sum()/w
             top5=g.head(5).groupby(gcols,sort=False)[alpha].mean(); top5.columns=[c.replace('past_label_','past_top5_') if c.startswith('past_label_') else c.replace('label_','ret_top5_') for c in top5.columns]
             return res.join(top5).reset_index()
+        import pyarrow as pa, pyarrow.parquet as pq
+        writer, tmp_op, rows = None, Path(str(op)+'.tmp'), 0
+        tmp_op.parent.mkdir(parents=True, exist_ok=True)
         with cf.ThreadPoolExecutor(max_workers=8) as ex:
             futs = [ex.submit(_process_chunk, dt, chunk) for dt, chunk in lab.groupby('decision_time', dropna=False, sort=False)]
-            res_list = [f.result() for f in futs if f.result() is not None]
-        if not res_list: rows=0
-        else:
-            final_df=pd.concat(res_list, ignore_index=True); write_parquet_atomic(final_df,op); rows=len(final_df)
+            for f in futs:
+                odf = f.result()
+                if odf is not None and not odf.empty:
+                    table = pa.Table.from_pandas(odf)
+                    if writer is None: writer = pq.ParquetWriter(tmp_op, table.schema)
+                    writer.write_table(table)
+                    rows += len(odf)
+        if writer is not None:
+            writer.close()
+            os.replace(tmp_op, op)
+        elif tmp_op.exists(): tmp_op.unlink()
     meta={'stage':'theme_returns','status':'complete' if rows else 'empty','date':part.date,'layer_id':part.layer_id,'scale':part.scale,'output_rows':int(rows),'input':str(part.base),'output':str(op),'elapsed_sec':round(time.time()-t,3)}; manifest(out,meta); return meta
 
 def relation_one(part, returns_root, out_root, horizons, past_h, levels, tiers, skip, max_rg):
@@ -109,12 +120,23 @@ def relation_one(part, returns_root, out_root, horizons, past_h, levels, tiers, 
             fut_chunk = fut[fut['decision_time'] == dt]
             z=a.merge(fut_chunk,on=['decision_time','layer_id','scale','level','dst_theme_id'],how='inner')
             return z if not z.empty else None
+        import pyarrow as pa, pyarrow.parquet as pq
+        writer, tmp_op, rows = None, Path(str(op)+'.tmp'), 0
+        tmp_op.parent.mkdir(parents=True, exist_ok=True)
         with cf.ThreadPoolExecutor(max_workers=8) as ex:
             futs = [ex.submit(_process_rel_chunk, dt, chunk) for dt, chunk in past.groupby('decision_time', dropna=False, sort=False)]
-            res_list = [f.result() for f in futs if f.result() is not None]
-        if not res_list: rows=0
-        else:
-            final_df=pd.concat(res_list, ignore_index=True); final_df.insert(1,'date',part.date); write_parquet_atomic(final_df,op); rows=len(final_df)
+            for f in futs:
+                odf = f.result()
+                if odf is not None and not odf.empty:
+                    odf.insert(1,'date',part.date)
+                    table = pa.Table.from_pandas(odf)
+                    if writer is None: writer = pq.ParquetWriter(tmp_op, table.schema)
+                    writer.write_table(table)
+                    rows += len(odf)
+        if writer is not None:
+            writer.close()
+            os.replace(tmp_op, op)
+        elif tmp_op.exists(): tmp_op.unlink()
     meta={'stage':'relation_spillover','status':'complete' if rows else 'empty','date':part.date,'layer_id':part.layer_id,'scale':part.scale,'output_rows':int(rows),'input':str(part.base),'theme_returns':str(rp),'output':str(op),'elapsed_sec':round(time.time()-t,3)}; manifest(out,meta); return meta
 
 def path_id(s): return s.astype(str).str.replace(r'([.|_\-])?ts=[^.|_\-]+','',regex=True).str.replace(r'([.|_\-])?time=[^.|_\-]+','',regex=True)
