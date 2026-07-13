@@ -4,15 +4,23 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
-import concurrent.futures
 from pathlib import Path
+
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+os.environ.setdefault("ARROW_NUM_THREADS", "1")
 
 import pandas as pd
 
+from p2_parallel_runtime import bounded_thread_map
 
-def _process_label_file(args: tuple[Path, pd.DataFrame, list[str]]) -> tuple[int, int]:
-    label_path, daily_for_date, injected = args
+
+def _process_label_file(task: tuple[Path, pd.DataFrame, list[str]]) -> tuple[int, int]:
+    label_path, daily_for_date, injected = task
     if daily_for_date.empty:
         return 0, 0
     intraday = pd.read_parquet(label_path)
@@ -34,7 +42,13 @@ def prepare_daily_labels(daily: pd.DataFrame, mapping: pd.DataFrame) -> pd.DataF
     if missing := required_mapping - set(mapping):
         raise ValueError(f"symbol mapping missing {sorted(missing)}")
 
-    merged = daily.merge(mapping[["symbol", "symbol_id"]].drop_duplicates("symbol"), left_on="stable_symbol_id", right_on="symbol", how="inner", validate="many_to_one")
+    merged = daily.merge(
+        mapping[["symbol", "symbol_id"]].drop_duplicates("symbol"),
+        left_on="stable_symbol_id",
+        right_on="symbol",
+        how="inner",
+        validate="many_to_one",
+    )
     output = merged[["date", "symbol_id"]].copy()
     output["date"] = output["date"].astype(str)
 
@@ -60,26 +74,61 @@ def prepare_daily_labels(daily: pd.DataFrame, mapping: pd.DataFrame) -> pd.DataF
     return output
 
 
-def inject_daily_labels(labels_root: Path, daily_labels_path: Path, mapping_path: Path, month: str | None = None) -> dict:
+def inject_daily_labels(
+    labels_root: Path,
+    daily_labels_path: Path,
+    mapping_path: Path,
+    month: str | None = None,
+    workers: int = 8,
+) -> dict:
+    """Inject labels with shared-memory threads, never a 32-process pool."""
     daily = pd.read_parquet(daily_labels_path)
     mapping = pd.read_parquet(mapping_path)
     prepared = prepare_daily_labels(daily, mapping)
     pattern = f"date={month}-*" if month else "date=*"
     files = sorted(path / "labels.parquet" for path in labels_root.glob(pattern) if (path / "labels.parquet").exists())
-    updated = rows = 0
-    injected = [c for c in prepared if c.startswith("label_") or c == "daily_label_execution_policy"]
-    
-    tasks = []
+    injected = [column for column in prepared if column.startswith("label_") or column == "daily_label_execution_policy"]
+
+    prepared_by_date = {
+        str(date): subset.drop(columns="date").copy()
+        for date, subset in prepared.groupby("date", sort=False)
+    }
+    tasks: list[tuple[Path, pd.DataFrame, list[str]]] = []
     for label_path in files:
         date = label_path.parent.name.split("=", 1)[1]
-        daily_for_date = prepared.loc[prepared.date.eq(date)].drop(columns="date")
-        tasks.append((label_path, daily_for_date, injected))
-        
-    with concurrent.futures.ProcessPoolExecutor(max_workers=32) as executor:
-        for u, r in executor.map(_process_label_file, tasks):
-            updated += u
-            rows += r
-    return {"updated_files": updated, "rows": rows, "execution_policy": "next_session_open", "injected_columns": injected}
+        daily_for_date = prepared_by_date.get(date)
+        if daily_for_date is not None and not daily_for_date.empty:
+            tasks.append((label_path, daily_for_date, injected))
+
+    if not tasks:
+        return {
+            "updated_files": 0,
+            "rows": 0,
+            "execution_policy": "next_session_open",
+            "injected_columns": injected,
+            "workers": 0,
+            "parallel_backend": "bounded_threads",
+        }
+
+    worker_count = max(1, min(int(workers), len(tasks), os.cpu_count() or 1))
+    updated = rows = 0
+    for count, row_count in bounded_thread_map(
+        tasks,
+        worker_count,
+        _process_label_file,
+        max_in_flight=worker_count,
+    ):
+        updated += count
+        rows += row_count
+
+    return {
+        "updated_files": updated,
+        "rows": rows,
+        "execution_policy": "next_session_open",
+        "injected_columns": injected,
+        "workers": worker_count,
+        "parallel_backend": "bounded_threads",
+    }
 
 
 def main() -> None:
@@ -88,8 +137,15 @@ def main() -> None:
     parser.add_argument("--daily-labels", required=True)
     parser.add_argument("--mapping", required=True)
     parser.add_argument("--month")
+    parser.add_argument("--workers", type=int, default=8)
     args = parser.parse_args()
-    result = inject_daily_labels(Path(args.labels_root), Path(args.daily_labels), Path(args.mapping), args.month)
+    result = inject_daily_labels(
+        Path(args.labels_root),
+        Path(args.daily_labels),
+        Path(args.mapping),
+        args.month,
+        args.workers,
+    )
     print(json.dumps(result, indent=2, ensure_ascii=False))
 
 
