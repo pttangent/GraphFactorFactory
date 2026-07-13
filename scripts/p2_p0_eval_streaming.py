@@ -29,6 +29,17 @@ SUMMARY_COLUMNS = [
     "mean_spread",
     "positive_period_rate",
 ]
+SUMMARY_STATE_COLUMNS = [
+    "date",
+    *SUMMARY_KEYS,
+    "snapshots",
+    "sample_count",
+    "rank_ic_sum",
+    "rank_ic_count",
+    "spread_sum",
+    "spread_count",
+    "positive_count",
+]
 
 
 def _token(path: Path) -> str:
@@ -190,12 +201,12 @@ def _partial_summary_records(accumulator: dict, date: str) -> list[dict]:
         kind, feature, target, layer_id, scale = key
         records.append(
             {
-                "date": date,
-                "kind": kind,
-                "feature": feature,
-                "target": target,
-                "layer_id": layer_id,
-                "scale": scale,
+                "date": str(date),
+                "kind": str(kind),
+                "feature": str(feature),
+                "target": str(target),
+                "layer_id": str(layer_id),
+                "scale": str(scale),
                 "snapshots": len(state["snapshots"]),
                 "sample_count": int(state["sample_count"]),
                 "rank_ic_sum": float(state["rank_ic_sum"]),
@@ -209,7 +220,7 @@ def _partial_summary_records(accumulator: dict, date: str) -> list[dict]:
 
 
 def _summary_frame(records: list[dict] | pd.DataFrame) -> pd.DataFrame:
-    partial = records if isinstance(records, pd.DataFrame) else pd.DataFrame.from_records(records)
+    partial = records if isinstance(records, pd.DataFrame) else pd.DataFrame.from_records(records, columns=SUMMARY_STATE_COLUMNS)
     if partial.empty:
         return pd.DataFrame(columns=SUMMARY_COLUMNS)
     rows: list[dict] = []
@@ -245,6 +256,8 @@ def _state_valid(state_path: Path, input_path: Path, metric_path: Path, csv_path
         return None
     rows = int(payload.get("rows", 0))
     if rows > 0 and not metric_path.exists():
+        return None
+    if rows == 0 and metric_path.exists():
         return None
     if csv_path is not None and rows > 0 and not csv_path.exists():
         return None
@@ -362,6 +375,11 @@ def evaluate_p0_streaming(
             "elapsed_sec": 0.0,
         }
     if not files:
+        shutil.rmtree(output_dir / "p0_alpha_metrics.parquet", ignore_errors=True)
+        shutil.rmtree(output_dir / ".p0_metric_state", ignore_errors=True)
+        shutil.rmtree(output_dir / "p0_alpha_metrics_csv", ignore_errors=True)
+        for name in ("p0_alpha_metrics.csv", "p0_alpha_summary.csv", "p0_alpha_summary_state.parquet"):
+            (output_dir / name).unlink(missing_ok=True)
         metadata = {
             "stage": "p0_alpha_eval",
             "status": "empty",
@@ -408,7 +426,7 @@ def evaluate_p0_streaming(
 
     metric_rows = int(sum(int(result.get("rows", 0)) for result in results))
     summary_records = [record for result in results for record in result.get("summary_records", [])]
-    summary_state = pd.DataFrame.from_records(summary_records)
+    summary_state = pd.DataFrame.from_records(summary_records, columns=SUMMARY_STATE_COLUMNS)
     summary = _summary_frame(summary_state)
     _write_frame_atomic(summary_state, output_dir / "p0_alpha_summary_state.parquet", parquet=True)
     _write_frame_atomic(summary, output_dir / "p0_alpha_summary.csv", parquet=False)
