@@ -61,13 +61,13 @@ def _nested_shape(target: int, outer_cap: int, requested_inner: int, inner_cap: 
     if requested_inner > 0:
         inner = min(inner_cap, requested_inner)
         return max(1, min(outer_cap, math.ceil(target / inner))), inner
-    best = (1, 1, 1)
+    best_slots, best_outer, best_inner = 1, 1, 1
     for inner in range(1, inner_cap + 1):
         outer = max(1, min(outer_cap, target // inner))
-        candidate = (outer * inner, outer, inner)
-        if candidate[0] <= target and candidate > best:
-            best = candidate
-    return best[1], best[2]
+        slots = outer * inner
+        if slots > best_slots or (slots == best_slots and inner > best_inner):
+            best_slots, best_outer, best_inner = slots, outer, inner
+    return best_outer, best_inner
 
 
 def build_plan(
@@ -91,17 +91,9 @@ def build_plan(
         return StagePlan(stage, workers, 1, workers, per_worker, workers * per_worker, reason)
 
     theme_memory = memory("build-theme-returns")
-    theme_outer, theme_inner = _nested_shape(
-        target,
-        _worker_cap(usable_ram, theme_memory, target),
-        inner_workers,
-    )
+    theme_outer, theme_inner = _nested_shape(target, _worker_cap(usable_ram, theme_memory, target), inner_workers)
     relation_memory = memory("relation-spillover")
-    relation_outer, relation_inner = _nested_shape(
-        target,
-        _worker_cap(usable_ram, relation_memory, target),
-        inner_workers,
-    )
+    relation_outer, relation_inner = _nested_shape(target, _worker_cap(usable_ram, relation_memory, target), inner_workers)
     return {
         "p0-direct-date": simple(
             "p0-direct-date",
@@ -172,22 +164,14 @@ def common_filters(args: argparse.Namespace) -> list[str]:
 
 def eval_filters(args: argparse.Namespace) -> list[str]:
     output: list[str] = []
-    for name, value in (
-        ("--dates", args.dates),
-        ("--layers", args.layers),
-        ("--scales", args.scales),
-    ):
+    for name, value in (("--dates", args.dates), ("--layers", args.layers), ("--scales", args.scales)):
         output += csv_arg(name, value)
     return output
 
 
 def p0_filters(args: argparse.Namespace) -> list[str]:
     output: list[str] = []
-    for name, value in (
-        ("--dates", args.dates),
-        ("--layers", args.layers),
-        ("--scales", args.scales),
-    ):
+    for name, value in (("--dates", args.dates), ("--layers", args.layers), ("--scales", args.scales)):
         output += csv_arg(name, value)
     intraday = [horizon for horizon in args.horizons.split(",") if horizon.endswith("m")]
     output += ["--horizons", ",".join(intraday or DEFAULT_INTRADAY_HORIZONS)]
@@ -246,8 +230,7 @@ def main() -> None:
         "--stage",
         choices=[
             "all", "p0", "p0-node", "p0-edge", "p0-graph", "p0-eval",
-            "theme", "relation", "intraday", "daily",
-            "intraday-eval", "daily-eval", "eval",
+            "theme", "relation", "intraday", "daily", "intraday-eval", "daily-eval", "eval",
         ],
         default="all",
     )
@@ -278,10 +261,7 @@ def main() -> None:
         "ram_gb": args.ram_gb,
         "reserve_ram_gb": args.reserve_ram_gb,
         "schedulable_ram_gb": (args.ram_gb - args.reserve_ram_gb) * 0.90,
-        "worker_recycling": {
-            "tasks_per_child": args.tasks_per_child,
-            "zero_means_pool_lifetime": True,
-        },
+        "worker_recycling": {"tasks_per_child": args.tasks_per_child, "zero_means_pool_lifetime": True},
         "parquet_target_rows": args.parquet_target_rows,
         "p0_execution": {
             "mode": "canonical_date_single_pass",
@@ -316,14 +296,10 @@ def main() -> None:
         feature_map = {"p0-node": "node", "p0-edge": "spillover", "p0-graph": "graph"}
         features = feature_map.get(args.stage, "node,spillover,graph")
         command = [
-            python, args.p0_script, "direct",
-            "--p0-root", args.p0_root,
-            "--labels-root", args.labels_root,
-            "--out-root", str(root),
-            "--features", features,
-            "--past-horizon", args.past_horizon,
-            "--workers", str(p0_date_workers),
-            "--batch-size", str(args.p0_batch_size),
+            python, args.p0_script, "direct", "--p0-root", args.p0_root,
+            "--labels-root", args.labels_root, "--out-root", str(root),
+            "--features", features, "--past-horizon", args.past_horizon,
+            "--workers", str(p0_date_workers), "--batch-size", str(args.p0_batch_size),
             "--min-free-gb", str(args.p0_min_free_gb),
             "--disk-check-every", str(args.p0_disk_check_every),
         ] + p0_filters(args)
@@ -333,10 +309,8 @@ def main() -> None:
         eval_dir = root / "p0_alpha" / scope_name(args.dates)
         stage = plan["p0-eval"]
         command = [
-            python, args.p0_script, "eval-p0",
-            "--p0-alpha-root", str(root),
-            "--out-dir", str(eval_dir),
-            "--workers", str(stage.workers),
+            python, args.p0_script, "eval-p0", "--p0-alpha-root", str(root),
+            "--out-dir", str(eval_dir), "--workers", str(stage.workers),
             "--csv-mode", args.eval_csv_mode,
         ]
         month = single_month(args.dates)
@@ -351,14 +325,9 @@ def main() -> None:
             raise SystemExit("--p1-root required for theme stage")
         stage = plan["build-theme-returns"]
         run_command(
-            [
-                python, args.p2_script, "build-theme-returns",
-                "--p1-root", args.p1_root,
-                "--labels-root", args.labels_root,
-                "--out-root", str(root / "theme_returns"),
-                "--workers", str(stage.workers),
-                "--inner-workers", str(stage.inner_workers),
-            ] + common,
+            [python, args.p2_script, "build-theme-returns", "--p1-root", args.p1_root,
+             "--labels-root", args.labels_root, "--out-root", str(root / "theme_returns"),
+             "--workers", str(stage.workers), "--inner-workers", str(stage.inner_workers)] + common,
             environment,
             args.dry_run,
         )
@@ -368,13 +337,11 @@ def main() -> None:
             raise SystemExit("--p1-root required for relation stage")
         stage = plan["relation-spillover"]
         command = [
-            python, args.p2_script, "relation-spillover",
-            "--p1-root", args.p1_root,
+            python, args.p2_script, "relation-spillover", "--p1-root", args.p1_root,
             "--theme-returns-root", str(root / "theme_returns"),
             "--out-root", str(root / "relation_spillover"),
             "--past-horizon", args.past_horizon,
-            "--workers", str(stage.workers),
-            "--inner-workers", str(stage.inner_workers),
+            "--workers", str(stage.workers), "--inner-workers", str(stage.inner_workers),
         ] + common
         command += csv_arg("--tiers", args.tiers)
         run_command(command, environment, args.dry_run)
@@ -382,13 +349,11 @@ def main() -> None:
     if args.stage in {"all", "intraday"}:
         stage = plan["intraday-relation-features"]
         run_command(
-            [
-                python, args.p2_script, "intraday-relation-features",
-                "--signals-root", str(root / "relation_spillover"),
-                "--out-root", str(root / "intraday_relation_features"),
-                "--workers", str(stage.workers),
-                "--underreaction-past-horizon", args.underreaction_past_horizon,
-            ] + common,
+            [python, args.p2_script, "intraday-relation-features",
+             "--signals-root", str(root / "relation_spillover"),
+             "--out-root", str(root / "intraday_relation_features"),
+             "--workers", str(stage.workers),
+             "--underreaction-past-horizon", args.underreaction_past_horizon] + common,
             environment,
             args.dry_run,
         )
@@ -398,15 +363,12 @@ def main() -> None:
             raise SystemExit("--p1-root required for daily temporal episode identity")
         stage = plan["daily-relation-features"]
         run_command(
-            [
-                python, args.p2_script, "daily-relation-features",
-                "--signals-root", str(root / "relation_spillover"),
-                "--p1-root", args.p1_root,
-                "--out-root", str(root / "daily_relation_features"),
-                "--workers", str(stage.workers),
-                "--late-minutes", str(args.late_minutes),
-                "--underreaction-past-horizon", args.underreaction_past_horizon,
-            ] + common,
+            [python, args.p2_script, "daily-relation-features",
+             "--signals-root", str(root / "relation_spillover"),
+             "--p1-root", args.p1_root,
+             "--out-root", str(root / "daily_relation_features"),
+             "--workers", str(stage.workers), "--late-minutes", str(args.late_minutes),
+             "--underreaction-past-horizon", args.underreaction_past_horizon] + common,
             environment,
             args.dry_run,
         )
@@ -418,8 +380,7 @@ def main() -> None:
             python, args.p2_script, "evaluate-intraday",
             "--features-root", str(root / "intraday_relation_features"),
             "--out-dir", str(root / "intraday_relation_eval" / eval_scope),
-            "--workers", str(stage.workers),
-            "--csv-mode", args.eval_csv_mode,
+            "--workers", str(stage.workers), "--csv-mode", args.eval_csv_mode,
         ] + eval_filters(args)
         if args.skip_existing:
             command.append("--skip-existing")
@@ -431,8 +392,7 @@ def main() -> None:
             python, args.p2_script, "evaluate-daily",
             "--features-root", str(root / "daily_relation_features"),
             "--out-dir", str(root / "daily_relation_eval" / eval_scope),
-            "--workers", str(stage.workers),
-            "--csv-mode", args.eval_csv_mode,
+            "--workers", str(stage.workers), "--csv-mode", args.eval_csv_mode,
         ] + eval_filters(args)
         if args.skip_existing:
             command.append("--skip-existing")
