@@ -7,7 +7,7 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Iterator
 
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
@@ -131,10 +131,118 @@ def _arrow_to_pandas(table: pa.Table) -> pd.DataFrame:
     return table.to_pandas(split_blocks=True, self_destruct=True)
 
 
+def selected_parquet_columns(parquet: pq.ParquetFile, columns: Iterable[str] | None) -> list[str] | None:
+    if columns is None:
+        return None
+    available = set(parquet.schema.names)
+    return [column for column in columns if column in available]
+
+
+def iter_partition_batches(
+    path: str | Path,
+    columns: Iterable[str] | None = None,
+    max_row_groups: int | None = None,
+    batch_size: int = 250_000,
+) -> Iterator[pd.DataFrame]:
+    """Read a parquet partition in bounded batches without materializing the file."""
+    parquet = pq.ParquetFile(path)
+    selected = selected_parquet_columns(parquet, columns)
+    if selected == []:
+        return
+    row_group_count = parquet.metadata.num_row_groups
+    if max_row_groups is not None:
+        row_group_count = min(row_group_count, max_row_groups)
+    for row_group in range(row_group_count):
+        for batch in parquet.iter_batches(
+            row_groups=[row_group],
+            columns=selected,
+            batch_size=max(1, int(batch_size)),
+            use_threads=False,
+        ):
+            table = pa.Table.from_batches([batch])
+            frame = _arrow_to_pandas(table)
+            if not frame.empty:
+                yield frame
+
+
+def iter_time_groups(
+    path: str | Path,
+    columns: Iterable[str] | None = None,
+    max_row_groups: int | None = None,
+    *,
+    time_column: str = "decision_time",
+    batch_size: int = 250_000,
+    utc: bool = True,
+) -> Iterator[tuple[pd.Timestamp, pd.DataFrame]]:
+    """Yield complete timestamp groups while retaining at most one carry group.
+
+    Input must be globally non-decreasing by ``time_column``. The check is
+    deliberate: temporal P1/P2 logic must fail rather than silently reorder a
+    full shard in memory.
+    """
+    carry: pd.DataFrame | None = None
+    last_seen: pd.Timestamp | None = None
+    for batch in iter_partition_batches(path, columns, max_row_groups, batch_size):
+        if time_column not in batch:
+            raise ValueError(f"{time_column} missing from {path}")
+        batch = batch.copy()
+        batch[time_column] = pd.to_datetime(batch[time_column], utc=utc, errors="coerce")
+        batch = batch.dropna(subset=[time_column])
+        if batch.empty:
+            continue
+        batch = batch.sort_values(time_column, kind="mergesort")
+        batch_min = batch[time_column].iloc[0]
+        if last_seen is not None and batch_min < last_seen:
+            raise ValueError(f"{path} is not globally sorted by {time_column}; refusing full-file fallback")
+        if carry is not None and not carry.empty:
+            batch = pd.concat([carry, batch], ignore_index=True, copy=False)
+        last_time = batch[time_column].iloc[-1]
+        complete = batch.loc[batch[time_column] < last_time]
+        carry = batch.loc[batch[time_column].eq(last_time)].copy()
+        for timestamp, group in complete.groupby(time_column, sort=False, dropna=False):
+            yield timestamp, group
+        last_seen = last_time
+    if carry is not None and not carry.empty:
+        for timestamp, group in carry.groupby(time_column, sort=False, dropna=False):
+            yield timestamp, group
+
+
+def merge_time_group_streams(
+    left: Iterable[tuple[pd.Timestamp, pd.DataFrame]],
+    right: Iterable[tuple[pd.Timestamp, pd.DataFrame]],
+) -> Iterator[tuple[pd.Timestamp, pd.DataFrame, pd.DataFrame]]:
+    """Inner-join two sorted timestamp-group streams with constant memory."""
+    left_iter, right_iter = iter(left), iter(right)
+    try:
+        left_item = next(left_iter)
+        right_item = next(right_iter)
+    except StopIteration:
+        return
+    while True:
+        left_time, left_frame = left_item
+        right_time, right_frame = right_item
+        if left_time == right_time:
+            yield left_time, left_frame, right_frame
+            try:
+                left_item = next(left_iter)
+                right_item = next(right_iter)
+            except StopIteration:
+                return
+        elif left_time < right_time:
+            try:
+                left_item = next(left_iter)
+            except StopIteration:
+                return
+        else:
+            try:
+                right_item = next(right_iter)
+            except StopIteration:
+                return
+
+
 def read_partition(path: str | Path, columns: Iterable[str] | None = None, max_row_groups: int | None = None) -> pd.DataFrame:
     parquet = pq.ParquetFile(path)
-    available = set(parquet.schema.names)
-    selected = None if columns is None else [column for column in columns if column in available]
+    selected = selected_parquet_columns(parquet, columns)
     if selected == []:
         return pd.DataFrame()
     if max_row_groups is None:
