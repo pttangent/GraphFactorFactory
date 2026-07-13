@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 
 from p2_alpha_pit_features import DEFAULT_INTRADAY_HORIZONS, PIT_CONTRACT_VERSION, csvlist, csvset
 from p2_eval_layout import prepare_eval_output
@@ -11,6 +12,8 @@ from p2_parallel_runtime import collect_process_map
 from p2_p0_canonical_direct import STAGE_LAYOUT, run_direct
 from p2_p0_eval_streaming import evaluate_p0_streaming
 from p2_p0_graph_alpha import discover, edge_spillover_one, graph_state_one, node_features_one
+
+os.environ.setdefault("GFF_MIN_FREE_GB", "50")
 
 
 def pool(parts, workers, function, *args):
