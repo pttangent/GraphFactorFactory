@@ -11,6 +11,17 @@ on:
       - "tests/test_p2_daily_streaming.py"
       - "tests/test_p2_parallel_runtime.py"
       - ".github/workflows/pipeline-resource-tests.yml"
+  pull_request:
+    branches:
+      - v5-daily-labels-integration
+    paths:
+      - "scripts/**"
+      - "tests/test_p0_eval_parallel.py"
+      - "tests/test_p2_eval_resumable.py"
+      - "tests/test_p2_daily_streaming.py"
+      - "tests/test_p2_parallel_runtime.py"
+      - ".github/ci-trigger/**"
+      - ".github/workflows/pipeline-resource-tests.yml"
   workflow_dispatch:
 
 jobs:
