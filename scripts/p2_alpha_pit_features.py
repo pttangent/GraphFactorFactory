@@ -7,14 +7,15 @@ import json
 import os
 from pathlib import Path
 
+from p2_eval_layout import prepare_eval_output
+from p2_eval_streaming import evaluate_feature_root, merge_evaluation_states
 from p2_parallel_runtime import collect_process_map
 from p2_pit_core import *
-from p2_streaming_io import stream_frames
-from p2_pit_theme import *
-from p2_pit_theme_streaming import build_theme_returns_one, relation_spillover_one
 from p2_pit_features import *
 from p2_pit_runner_streaming import build_feature_one
-from p2_eval_streaming import evaluate_feature_root, merge_evaluation_states
+from p2_pit_theme import *
+from p2_pit_theme_streaming import build_theme_returns_one, relation_spillover_one
+from p2_streaming_io import stream_frames
 
 
 def pool(parts: list[Part], workers: int, function, *args) -> list[dict]:
@@ -120,8 +121,10 @@ def main() -> None:
         results = pool(parts, args.workers, build_feature_one, args.out_root, mode, args.underreaction_past_horizon, args.late_minutes, args.skip_existing, args.max_row_groups, args.p1_root)
         save_run_summary(args.out_root, results)
     elif args.command == "evaluate-intraday":
+        prepare_eval_output(args.out_dir, "intraday", args.csv_mode)
         results = evaluate_feature_root(args.features_root, args.out_dir, "intraday", args.workers, dates, layers, scales, args.csv_mode, args.skip_existing)
     elif args.command == "evaluate-daily":
+        prepare_eval_output(args.out_dir, "daily", args.csv_mode)
         results = evaluate_feature_root(args.features_root, args.out_dir, "daily", args.workers, dates, layers, scales, args.csv_mode, args.skip_existing)
     elif args.command == "merge-intraday-eval":
         results = merge_evaluation_states(args.evaluation_root, args.out_dir, "intraday")
