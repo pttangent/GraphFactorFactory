@@ -5,15 +5,18 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "scripts"
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
+from p2_eval_layout import prepare_eval_output
 from p2_eval_streaming import EVAL_CONTRACT_VERSION, evaluate_feature_root, merge_evaluation_states
 from p2_exact_eval import evaluate_intraday_frame_exact
 from p2_pit_features import evaluate_intraday_frame
+from p2_streaming_io import stream_frames
 
 
 def test_exact_intraday_kernel_matches_legacy_with_nan_inf_ties_and_constant():
@@ -130,3 +133,35 @@ def test_global_summary_merges_monthly_states_without_feature_rescan(tmp_path: P
     assert summary.loc[0, "snapshots"] == 4
     assert summary.loc[0, "mean_rank_ic"] == 0.75
     assert summary.loc[0, "mean_spread"] == 0.15
+
+
+def test_legacy_single_file_eval_layout_is_removed_before_dataset_resume(tmp_path: Path):
+    out = tmp_path / "p0_alpha" / "202601"
+    out.mkdir(parents=True)
+    metrics = out / "p0_alpha_metrics.parquet"
+    metrics.write_bytes(b"legacy-single-file")
+    (out / "p0_alpha_metrics.csv").write_text("legacy", encoding="utf-8")
+    legacy_work = out / ".p0_eval_work"
+    legacy_work.mkdir()
+    (legacy_work / "part.parquet").write_bytes(b"partial")
+
+    report = prepare_eval_output(out, "p0", "none")
+    assert report["removed_legacy_artifacts"]
+    assert not metrics.exists()
+    assert not (out / "p0_alpha_metrics.csv").exists()
+    assert not legacy_work.exists()
+    metrics.mkdir()
+    assert metrics.is_dir()
+
+
+def test_streamed_parquet_disk_fuse_preserves_existing_final(tmp_path: Path, monkeypatch):
+    destination = tmp_path / "result.parquet"
+    original = pd.DataFrame({"value": [1, 2, 3]})
+    original.to_parquet(destination, index=False)
+    original_bytes = destination.read_bytes()
+    monkeypatch.setenv("GFF_MIN_FREE_GB", "1000000000")
+
+    with pytest.raises(OSError, match="disk fuse"):
+        stream_frames(destination, [pd.DataFrame({"value": [4, 5, 6]})])
+    assert destination.read_bytes() == original_bytes
+    assert not Path(str(destination) + ".tmp").exists()
