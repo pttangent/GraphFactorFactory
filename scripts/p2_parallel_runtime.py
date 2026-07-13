@@ -91,11 +91,11 @@ def bounded_thread_map_ordered(
     *,
     max_in_flight: int | None = None,
 ) -> Iterator[R]:
-    """Yield bounded thread results in input order without head-of-line idling.
+    """Yield deterministic ordered results with a strictly bounded reorder window.
 
-    Completed later snapshots are buffered by sequence number while the executor
-    immediately receives replacement work. Output remains deterministic and
-    sorted, but one slow early snapshot no longer leaves the other threads idle.
+    ``pending + ready`` never exceeds ``max_in_flight``. Later snapshots may
+    finish inside that window, but replacement work is submitted only after the
+    next ordered result is yielded. This preserves output order and memory bounds.
     """
     workers = max(1, int(workers))
     limit = max(workers, int(max_in_flight or workers * 2))
@@ -117,15 +117,18 @@ def bounded_thread_map_ordered(
         for _ in range(limit):
             if not submit_one():
                 break
-        while pending:
+        while pending or ready:
+            while next_output in ready:
+                result = ready.pop(next_output)
+                next_output += 1
+                submit_one()
+                yield result
+            if not pending:
+                break
             done, _ = cf.wait(set(pending), return_when=cf.FIRST_COMPLETED)
             for future in done:
                 index = pending.pop(future)
                 ready[index] = future.result()
-                submit_one()
-            while next_output in ready:
-                yield ready.pop(next_output)
-                next_output += 1
     except BaseException:
         for future in pending:
             future.cancel()
