@@ -45,14 +45,17 @@ jobs:
         run: >-
           python -m compileall -q
           scripts/p2_checkpoint.py
+          scripts/p2_eval_layout.py
           scripts/p2_parallel_runtime.py
           scripts/p2_streaming_io.py
           scripts/p2_pit_theme_streaming.py
+          scripts/p2_theme_date_runner.py
           scripts/p2_pit_runner_streaming.py
           scripts/p2_daily_streaming.py
           scripts/p2_exact_eval.py
           scripts/p2_eval_streaming.py
           scripts/p2_p0_eval_streaming.py
+          scripts/p2_p0_graph_alpha_v2.py
           scripts/p2_alpha_pit_features.py
           scripts/run_p2_24core_scheduler.py
           scripts/run_full_alpha_streaming_6m.py
