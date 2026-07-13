@@ -144,25 +144,28 @@ def iter_partition_batches(
     max_row_groups: int | None = None,
     batch_size: int = 250_000,
 ) -> Iterator[pd.DataFrame]:
-    """Read a parquet partition in bounded batches without materializing the file."""
+    """Read a parquet partition in bounded batches and always close its handle."""
     parquet = pq.ParquetFile(path)
-    selected = selected_parquet_columns(parquet, columns)
-    if selected == []:
-        return
-    row_group_count = parquet.metadata.num_row_groups
-    if max_row_groups is not None:
-        row_group_count = min(row_group_count, max_row_groups)
-    for row_group in range(row_group_count):
-        for batch in parquet.iter_batches(
-            row_groups=[row_group],
-            columns=selected,
-            batch_size=max(1, int(batch_size)),
-            use_threads=False,
-        ):
-            table = pa.Table.from_batches([batch])
-            frame = _arrow_to_pandas(table)
-            if not frame.empty:
-                yield frame
+    try:
+        selected = selected_parquet_columns(parquet, columns)
+        if selected == []:
+            return
+        row_group_count = parquet.metadata.num_row_groups
+        if max_row_groups is not None:
+            row_group_count = min(row_group_count, max_row_groups)
+        for row_group in range(row_group_count):
+            for batch in parquet.iter_batches(
+                row_groups=[row_group],
+                columns=selected,
+                batch_size=max(1, int(batch_size)),
+                use_threads=False,
+            ):
+                table = pa.Table.from_batches([batch])
+                frame = _arrow_to_pandas(table)
+                if not frame.empty:
+                    yield frame
+    finally:
+        parquet.close()
 
 
 def iter_time_groups(
@@ -242,16 +245,19 @@ def merge_time_group_streams(
 
 def read_partition(path: str | Path, columns: Iterable[str] | None = None, max_row_groups: int | None = None) -> pd.DataFrame:
     parquet = pq.ParquetFile(path)
-    selected = selected_parquet_columns(parquet, columns)
-    if selected == []:
-        return pd.DataFrame()
-    if max_row_groups is None:
-        table = parquet.read(columns=selected, use_threads=False)
-    else:
-        row_groups = list(range(min(max_row_groups, parquet.metadata.num_row_groups)))
-        if not row_groups:
+    try:
+        selected = selected_parquet_columns(parquet, columns)
+        if selected == []:
             return pd.DataFrame()
-        table = parquet.read_row_groups(row_groups, columns=selected, use_threads=False)
+        if max_row_groups is None:
+            table = parquet.read(columns=selected, use_threads=False)
+        else:
+            row_groups = list(range(min(max_row_groups, parquet.metadata.num_row_groups)))
+            if not row_groups:
+                return pd.DataFrame()
+            table = parquet.read_row_groups(row_groups, columns=selected, use_threads=False)
+    finally:
+        parquet.close()
     return _arrow_to_pandas(table)
 
 
@@ -335,26 +341,31 @@ def zscore_by_group(frame: pd.DataFrame, group_columns: list[str], column: str) 
 def load_labels(path: str | Path, horizons: list[str]) -> pd.DataFrame:
     """Load targets and construct only fully-realized past intraday returns."""
     parquet = pq.ParquetFile(path)
-    names = set(parquet.schema.names)
-    valid = [horizon for horizon in horizons if f"label_{horizon}" in names]
-    if not valid:
-        raise ValueError(f"no requested label columns in {path}; requested={horizons}")
+    try:
+        names = set(parquet.schema.names)
+        valid = [horizon for horizon in horizons if f"label_{horizon}" in names]
+        if not valid:
+            raise ValueError(f"no requested label columns in {path}; requested={horizons}")
 
-    columns = ["decision_time", "symbol_id"]
-    if "label_entry_time" in names:
-        columns.append("label_entry_time")
-    for horizon in valid:
-        columns.append(f"label_{horizon}")
-        for candidate in (
-            f"label_entry_time_{horizon}",
-            f"label_exit_time_{horizon}",
-            f"label_entry_date_{horizon}",
-            f"label_exit_date_{horizon}",
-        ):
-            if candidate in names:
-                columns.append(candidate)
-    columns = list(dict.fromkeys(columns))
-    frame = _arrow_to_pandas(parquet.read(columns=columns, use_threads=False))
+        columns = ["decision_time", "symbol_id"]
+        if "label_entry_time" in names:
+            columns.append("label_entry_time")
+        for horizon in valid:
+            columns.append(f"label_{horizon}")
+            for candidate in (
+                f"label_entry_time_{horizon}",
+                f"label_exit_time_{horizon}",
+                f"label_entry_date_{horizon}",
+                f"label_exit_date_{horizon}",
+            ):
+                if candidate in names:
+                    columns.append(candidate)
+        columns = list(dict.fromkeys(columns))
+        table = parquet.read(columns=columns, use_threads=False)
+    finally:
+        parquet.close()
+
+    frame = _arrow_to_pandas(table)
     frame["decision_time"] = pd.to_datetime(frame["decision_time"], utc=True, errors="coerce")
     frame["symbol_id"] = pd.to_numeric(frame["symbol_id"], errors="coerce").astype("Int64")
     frame = frame.dropna(subset=["decision_time", "symbol_id"]).copy()
