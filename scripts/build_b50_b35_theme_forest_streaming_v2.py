@@ -32,31 +32,46 @@ P1_CONTRACT_VERSION = "p1-streaming-v2"
 
 
 class AtomicTableSink:
-    def __init__(self, path: Path, fmt: str = "parquet") -> None:
+    def __init__(self, path: Path, fmt: str = "parquet", max_rows_per_write: int = 100_000) -> None:
         self.final_path = path.with_suffix(".csv" if fmt == "csv" else ".parquet")
         self.temp_path = Path(str(self.final_path) + ".tmp")
         self.fmt = fmt
+        self.max_rows_per_write = max(1, int(max_rows_per_write))
         self.writer: pq.ParquetWriter | None = None
         self.csv_header_written = False
         self.rows = 0
+        self.write_batches = 0
         self.final_path.parent.mkdir(parents=True, exist_ok=True)
         self.temp_path.unlink(missing_ok=True)
 
     def write(self, rows: list[dict]) -> None:
         if not rows:
             return
-        frame = pd.DataFrame(rows)
-        self.rows += len(frame)
-        if self.fmt == "csv":
-            frame.to_csv(self.temp_path, mode="a", header=not self.csv_header_written, index=False)
-            self.csv_header_written = True
-            return
-        table = pa.Table.from_pandas(frame, preserve_index=False)
-        if self.writer is None:
-            self.writer = pq.ParquetWriter(self.temp_path, table.schema, compression="zstd", use_dictionary=True)
-        elif table.schema != self.writer.schema:
-            table = table.cast(self.writer.schema)
-        self.writer.write_table(table)
+        for start in range(0, len(rows), self.max_rows_per_write):
+            chunk = rows[start : start + self.max_rows_per_write]
+            frame = pd.DataFrame(chunk)
+            self.rows += len(frame)
+            self.write_batches += 1
+            if self.fmt == "csv":
+                frame.to_csv(
+                    self.temp_path,
+                    mode="a",
+                    header=not self.csv_header_written,
+                    index=False,
+                )
+                self.csv_header_written = True
+                continue
+            table = pa.Table.from_pandas(frame, preserve_index=False)
+            if self.writer is None:
+                self.writer = pq.ParquetWriter(
+                    self.temp_path,
+                    table.schema,
+                    compression="zstd",
+                    use_dictionary=True,
+                )
+            elif table.schema != self.writer.schema:
+                table = table.cast(self.writer.schema)
+            self.writer.write_table(table)
 
     def close(self, commit: bool) -> None:
         if self.writer is not None:
@@ -66,13 +81,15 @@ class AtomicTableSink:
             os.replace(self.temp_path, self.final_path)
         else:
             self.temp_path.unlink(missing_ok=True)
+            if commit:
+                self.final_path.unlink(missing_ok=True)
 
 
 def _normalise_edges(group: pd.DataFrame) -> pd.DataFrame:
-    group = group.copy()
-    if "scale" not in group:
-        group["scale"] = "default"
-    group = group[["decision_time", "layer_id", "scale", "src_id", "dst_id", "weight"]]
+    required = {"decision_time", "layer_id", "scale", "src_id", "dst_id", "weight"}
+    if missing := required - set(group):
+        raise ValueError(f"P1 physical shard missing required columns {sorted(missing)}")
+    group = group[["decision_time", "layer_id", "scale", "src_id", "dst_id", "weight"]].copy()
     group = group[group["src_id"] != group["dst_id"]]
     group["src_id"] = pd.to_numeric(group["src_id"], errors="coerce").astype("Int64")
     group["dst_id"] = pd.to_numeric(group["dst_id"], errors="coerce").astype("Int64")
@@ -81,6 +98,10 @@ def _normalise_edges(group: pd.DataFrame) -> pd.DataFrame:
     group["dst_id"] = group["dst_id"].astype("int64")
     group["layer_id"] = group["layer_id"].astype(str)
     group["scale"] = group["scale"].astype(str)
+    if group["layer_id"].nunique(dropna=False) != 1:
+        raise ValueError("P1 shard contains mixed layer_id values")
+    if group["scale"].nunique(dropna=False) != 1:
+        raise ValueError("P1 shard contains mixed scale values")
     group["weight"] = pd.to_numeric(group["weight"], errors="coerce").fillna(0.0).astype("float32")
     group["abs_weight"] = group["weight"].abs()
     return group
@@ -169,14 +190,33 @@ def build_shard(
             ts = str(decision_time)
             layer = str(group["layer_id"].iloc[0])
             scale = str(group["scale"].iloc[0])
-            members = set(map(int, pd.concat([group["src_id"], group["dst_id"]], ignore_index=True).unique()))
+            member_array = np.unique(
+                np.concatenate([group["src_id"].to_numpy(), group["dst_id"].to_numpy()])
+            )
+            members = set(map(int, member_array))
             pairs = compact_pairs(group)
             adjacency = build_adj_from_pairs(pairs, members)
             degree = weighted_degree(group)
             root_id = f"ts={safe_token(ts)}|layer={safe_token(layer)}|scale={safe_token(scale)}|root"
-            root_node = {"decision_time": ts, "layer_id": layer, "scale": scale, "theme_id": root_id, "parent_theme_id": "", "level": "ROOT", "depth": 0, "size": len(members), "is_leaf": False, "boundary_config": "root", "root_b50_theme_id": ""}
-            nodes50, tree50, memberships50, leaves50 = split_to_b50(ts, layer, scale, members, adjacency, degree, root_id, 1)
-            nodes35, tree35, memberships35, leaves35 = refine_to_b35(ts, layer, scale, leaves50, adjacency, degree)
+            root_node = {
+                "decision_time": ts,
+                "layer_id": layer,
+                "scale": scale,
+                "theme_id": root_id,
+                "parent_theme_id": "",
+                "level": "ROOT",
+                "depth": 0,
+                "size": len(members),
+                "is_leaf": False,
+                "boundary_config": "root",
+                "root_b50_theme_id": "",
+            }
+            nodes50, tree50, memberships50, leaves50 = split_to_b50(
+                ts, layer, scale, members, adjacency, degree, root_id, 1
+            )
+            nodes35, tree35, memberships35, leaves35 = refine_to_b35(
+                ts, layer, scale, leaves50, adjacency, degree
+            )
             sinks["theme_nodes"].write([root_node] + nodes50 + nodes35)
             sinks["theme_tree_edges"].write(tree50 + tree35)
             sinks["theme_memberships"].write(memberships50 + memberships35)
@@ -184,8 +224,12 @@ def build_shard(
             relations35 = build_relation_edges(ts, layer, scale, group, leaves35, "B35", relation_cfg)
             sinks["theme_relation_edges"].write(relations50 + relations35)
             if prev_ts is not None:
-                sinks["temporal_theme_edges"].write(temporal_edges_fast(str(prev_ts), ts, layer, scale, prev_b50, leaves50, "B50", temporal_cfg))
-                sinks["temporal_theme_edges"].write(temporal_edges_fast(str(prev_ts), ts, layer, scale, prev_b35, leaves35, "B35", temporal_cfg))
+                sinks["temporal_theme_edges"].write(
+                    temporal_edges_fast(str(prev_ts), ts, layer, scale, prev_b50, leaves50, "B50", temporal_cfg)
+                )
+                sinks["temporal_theme_edges"].write(
+                    temporal_edges_fast(str(prev_ts), ts, layer, scale, prev_b35, leaves35, "B35", temporal_cfg)
+                )
 
             def stats(leaves: list[tuple[str, set[int]]]) -> tuple[int, int, float]:
                 sizes = [len(item[1]) for item in leaves]
@@ -231,7 +275,9 @@ def build_shard(
         "input_mode": "parquet_batch_time_group_stream",
         "temporal_matching": "inverted_member_index_best_successor",
         "atomic_outputs": True,
+        "maximum_rows_per_sink_write": 100_000,
         "rows": {name: sink.rows for name, sink in sinks.items()},
+        "write_batches": {name: sink.write_batches for name, sink in sinks.items()},
         "b50": B50.__dict__,
         "b35": B35.__dict__,
         "relation": relation_cfg.__dict__,
@@ -255,9 +301,23 @@ def main() -> None:
     parser.add_argument("--hard-temporal-jaccard", type=float, default=0.25)
     parser.add_argument("--fuzzy-temporal-min", type=float, default=0.15)
     args = parser.parse_args()
-    relation = RelationConfig(hard_threshold=args.hard_relation_threshold, fuzzy_min_strength=args.fuzzy_relation_min, fuzzy_scale=args.fuzzy_relation_scale)
-    temporal = TemporalConfig(hard_jaccard=args.hard_temporal_jaccard, fuzzy_min_strength=args.fuzzy_temporal_min)
-    manifest = build_shard(Path(args.p0_edges_shard), Path(args.out_dir), args.output_format, args.max_snapshots, relation, temporal)
+    relation = RelationConfig(
+        hard_threshold=args.hard_relation_threshold,
+        fuzzy_min_strength=args.fuzzy_relation_min,
+        fuzzy_scale=args.fuzzy_relation_scale,
+    )
+    temporal = TemporalConfig(
+        hard_jaccard=args.hard_temporal_jaccard,
+        fuzzy_min_strength=args.fuzzy_temporal_min,
+    )
+    manifest = build_shard(
+        Path(args.p0_edges_shard),
+        Path(args.out_dir),
+        args.output_format,
+        args.max_snapshots,
+        relation,
+        temporal,
+    )
     print(json.dumps(manifest, indent=2, default=str))
 
 
