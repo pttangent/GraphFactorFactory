@@ -1,0 +1,54 @@
+name: Pipeline resource and PIT tests
+
+on:
+  push:
+    branches:
+      - v5-daily-labels-integration
+    paths:
+      - "scripts/**"
+      - "tests/test_p0_eval_parallel.py"
+      - "tests/test_p2_eval_resumable.py"
+      - "tests/test_p2_daily_streaming.py"
+      - "tests/test_p2_parallel_runtime.py"
+      - ".github/workflows/pipeline-resource-tests.yml"
+  workflow_dispatch:
+
+jobs:
+  focused-tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install focused test dependencies
+        run: python -m pip install --upgrade pip && python -m pip install -e ".[dev]"
+      - name: Compile changed pipeline modules
+        run: >-
+          python -m compileall -q
+          scripts/p2_checkpoint.py
+          scripts/p2_parallel_runtime.py
+          scripts/p2_streaming_io.py
+          scripts/p2_pit_theme_streaming.py
+          scripts/p2_pit_runner_streaming.py
+          scripts/p2_daily_streaming.py
+          scripts/p2_exact_eval.py
+          scripts/p2_eval_streaming.py
+          scripts/p2_p0_eval_streaming.py
+          scripts/p2_alpha_pit_features.py
+          scripts/run_p2_24core_scheduler.py
+          scripts/run_full_alpha_streaming_6m.py
+      - name: Run focused regression tests
+        run: >-
+          python -m pytest -q
+          tests/test_p0_eval_parallel.py
+          tests/test_p2_eval_resumable.py
+          tests/test_p2_daily_streaming.py
+          tests/test_p2_parallel_runtime.py
