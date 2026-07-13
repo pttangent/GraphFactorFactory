@@ -17,6 +17,8 @@ from p2_pit_theme import *
 from p2_pit_theme_streaming import build_theme_returns_one, relation_spillover_one
 from p2_streaming_io import stream_frames
 
+os.environ.setdefault("GFF_MIN_FREE_GB", "50")
+
 
 def pool(parts: list[Part], workers: int, function, *args) -> list[dict]:
     if not parts:
