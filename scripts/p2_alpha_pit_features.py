@@ -9,8 +9,10 @@ from pathlib import Path
 from p2_parallel_runtime import collect_process_map
 from p2_pit_core import *
 from p2_pit_theme import *
+from p2_pit_theme_streaming import build_theme_returns_one, relation_spillover_one
 from p2_pit_features import *
-from p2_pit_runner import build_feature_one
+from p2_pit_runner_streaming import build_feature_one
+from p2_eval_streaming import evaluate_feature_root
 
 
 def pool(parts: list[Part], workers: int, function, *args) -> list[dict]:
@@ -78,6 +80,10 @@ def main() -> None:
         evaluation = subparsers.add_parser(command)
         evaluation.add_argument("--features-root", required=True)
         evaluation.add_argument("--out-dir", required=True)
+        evaluation.add_argument("--workers", type=int, default=8)
+        evaluation.add_argument("--dates")
+        evaluation.add_argument("--layers")
+        evaluation.add_argument("--scales")
 
     args = parser.parse_args()
     dates = csvset(getattr(args, "dates", None))
@@ -102,9 +108,9 @@ def main() -> None:
         results = pool(parts, args.workers, build_feature_one, args.out_root, mode, args.underreaction_past_horizon, args.late_minutes, args.skip_existing, args.max_row_groups, args.p1_root)
         save_run_summary(args.out_root, results)
     elif args.command == "evaluate-intraday":
-        results = evaluate_feature_root(args.features_root, args.out_dir, "intraday")
+        results = evaluate_feature_root(args.features_root, args.out_dir, "intraday", args.workers, dates, layers, scales)
     else:
-        results = evaluate_feature_root(args.features_root, args.out_dir, "daily")
+        results = evaluate_feature_root(args.features_root, args.out_dir, "daily", args.workers, dates, layers, scales)
     print(json.dumps({"command": args.command, "result": results}, indent=2, ensure_ascii=False, default=str))
 
 
