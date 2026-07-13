@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -11,6 +12,41 @@ if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
 from p2_eval_streaming import EVAL_CONTRACT_VERSION, evaluate_feature_root, merge_evaluation_states
+from p2_exact_eval import evaluate_intraday_frame_exact
+from p2_pit_features import evaluate_intraday_frame
+
+
+def test_exact_intraday_kernel_matches_legacy_with_nan_inf_ties_and_constant():
+    rng = np.random.default_rng(31)
+    count = 48
+    frame = pd.DataFrame(
+        {
+            "date": ["2026-01-02"] * count,
+            "decision_time": [pd.Timestamp("2026-01-02T14:30:00Z")] * count,
+            "layer_id": ["3"] * count,
+            "scale": ["30m"] * count,
+            "level": ["B50"] * count,
+            "daily_pressure_score": rng.normal(size=count),
+            "daily_underreaction_score": rng.integers(-4, 5, size=count).astype(float),
+            "daily_consensus_score": rng.normal(size=count),
+            "late_confirmation_score_z": np.ones(count),
+            "target_5m": rng.normal(size=count),
+            "target_15m": rng.normal(size=count),
+            "pit_audit_pass": [True] * count,
+        }
+    )
+    frame.loc[[1, 5, 9], "daily_pressure_score"] = np.nan
+    frame.loc[[3, 7], "daily_underreaction_score"] = np.inf
+    frame.loc[[2, 5, 11, 12], "target_5m"] = np.nan
+    frame.loc[[0, 3, 7, 18, 21], "target_15m"] = np.nan
+
+    sort_columns = ["score", "target"]
+    actual = evaluate_intraday_frame_exact(frame).sort_values(sort_columns).reset_index(drop=True)
+    expected = evaluate_intraday_frame(frame).sort_values(sort_columns).reset_index(drop=True)
+    assert actual[sort_columns].equals(expected[sort_columns])
+    assert actual["sample_count"].tolist() == expected["sample_count"].tolist()
+    np.testing.assert_allclose(actual["rank_ic"], expected["rank_ic"], rtol=1e-12, atol=1e-12, equal_nan=True)
+    np.testing.assert_allclose(actual["top_minus_bottom"], expected["top_minus_bottom"], rtol=1e-12, atol=1e-12, equal_nan=True)
 
 
 def _write_intraday_partition(root: Path, date: str) -> None:
