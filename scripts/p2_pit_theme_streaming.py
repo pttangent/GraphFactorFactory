@@ -9,16 +9,9 @@ from pathlib import Path
 import pandas as pd
 import pyarrow.parquet as pq
 
-from p2_checkpoint import file_fingerprint, stage_checkpoint_valid
+from p2_checkpoint import file_fingerprint, read_json, stage_checkpoint_valid
 from p2_parallel_runtime import bounded_thread_map_ordered
-from p2_pit_core import (
-    Part,
-    iter_time_groups,
-    label_path,
-    load_labels,
-    merge_time_group_streams,
-    write_manifest,
-)
+from p2_pit_core import Part, iter_time_groups, label_path, load_labels, merge_time_group_streams, write_manifest
 from p2_pit_theme import _aggregate_theme_returns, _relation_signal_frame, expand_symmetric_relations
 from p2_streaming_io import stream_frames
 
@@ -35,15 +28,9 @@ def _lookup_indexed(indexed: pd.DataFrame, decision_time: pd.Timestamp) -> pd.Da
         return pd.DataFrame(columns=indexed.columns)
 
 
-def _cached_labels_indexed(
-    labels_root: str | Path,
-    date: str,
-    horizons: list[str],
-) -> tuple[pd.DataFrame, Path, dict]:
+def _cached_labels_indexed(path: Path, fingerprint: dict, horizons: list[str]) -> pd.DataFrame:
     """Keep at most one indexed daily label table in each long-lived worker."""
     global _LABEL_CACHE_KEY, _LABEL_CACHE_INDEXED
-    path = label_path(labels_root, date)
-    fingerprint = file_fingerprint(path)
     key = (
         fingerprint["path"],
         fingerprint["size_bytes"],
@@ -54,7 +41,7 @@ def _cached_labels_indexed(
         labels = load_labels(path, horizons)
         _LABEL_CACHE_INDEXED = labels.set_index("decision_time", drop=False).sort_index()
         _LABEL_CACHE_KEY = key
-    return _LABEL_CACHE_INDEXED, path, fingerprint
+    return _LABEL_CACHE_INDEXED
 
 
 def _normalise_membership(group: pd.DataFrame, part: Part, levels: set[str] | None) -> pd.DataFrame:
@@ -97,11 +84,9 @@ def build_theme_returns_one(
     started = time.time()
     output_dir = Path(output_root) / f"date={part.date}" / f"layer_id={part.layer_id}" / f"scale={part.scale}"
     output_path = output_dir / "theme_returns.parquet"
-    labels_indexed, labels_file, labels_fingerprint = _cached_labels_indexed(labels_root, part.date, horizons)
-    inputs = {
-        "memberships": file_fingerprint(part.base),
-        "labels": labels_fingerprint,
-    }
+    labels_file = label_path(labels_root, part.date)
+    labels_fingerprint = file_fingerprint(labels_file)
+    inputs = {"memberships": file_fingerprint(part.base), "labels": labels_fingerprint}
     config = {
         "horizons": list(horizons),
         "levels": sorted(levels) if levels else None,
@@ -117,6 +102,7 @@ def build_theme_returns_one(
     ):
         return {"stage": "theme_returns", "status": "skipped", "date": part.date, "layer_id": part.layer_id, "scale": part.scale}
 
+    labels_indexed = _cached_labels_indexed(labels_file, labels_fingerprint, horizons)
     columns = ["decision_time", "layer_id", "scale", "level", "theme_id", "member_id", "core_score", "rank_in_theme"]
 
     def groups() -> Iterable[tuple[pd.Timestamp, pd.DataFrame]]:
@@ -185,9 +171,9 @@ def _normalise_returns(group: pd.DataFrame, part: Part) -> pd.DataFrame:
     group["scale"] = group["scale"].astype(str)
     if not group.empty:
         if not group["layer_id"].eq(str(part.layer_id)).all():
-            raise ValueError(f"mixed layer_id inside theme-return partition {part.base}")
+            raise ValueError("mixed layer_id inside theme-return partition")
         if not group["scale"].eq(str(part.scale)).all():
-            raise ValueError(f"mixed scale inside theme-return partition {part.base}")
+            raise ValueError("mixed scale inside theme-return partition")
     return group
 
 
@@ -227,12 +213,7 @@ def _source_target(returns: pd.DataFrame, horizons: list[str], past_horizon: str
     return source, returns[target_columns].rename(columns=rename)
 
 
-def _normalise_edges(
-    edges: pd.DataFrame,
-    part: Part,
-    levels: set[str] | None,
-    tiers: set[str] | None,
-) -> pd.DataFrame:
+def _normalise_edges(edges: pd.DataFrame, part: Part, levels: set[str] | None, tiers: set[str] | None) -> pd.DataFrame:
     edges = edges.copy()
     edges["decision_time"] = pd.to_datetime(edges["decision_time"], utc=True, errors="coerce")
     edges = edges.dropna(subset=["decision_time", "src_theme_id", "dst_theme_id"])
@@ -267,16 +248,11 @@ def relation_spillover_one(
     inner_workers: int,
 ) -> dict:
     started = time.time()
-    returns_path = Path(returns_root) / f"date={part.date}" / f"layer_id={part.layer_id}" / f"scale={part.scale}" / "theme_returns.parquet"
+    returns_dir = Path(returns_root) / f"date={part.date}" / f"layer_id={part.layer_id}" / f"scale={part.scale}"
+    returns_path = returns_dir / "theme_returns.parquet"
+    returns_manifest = returns_dir / "manifest.json"
     output_dir = Path(output_root) / f"date={part.date}" / f"layer_id={part.layer_id}" / f"scale={part.scale}"
     output_path = output_dir / "relation_spillover_signals.parquet"
-    if not returns_path.exists():
-        return {"stage": "relation_spillover", "status": "missing_theme_returns", "date": part.date, "layer_id": part.layer_id, "scale": part.scale}
-
-    inputs = {
-        "relation_edges": file_fingerprint(part.base),
-        "theme_returns": file_fingerprint(returns_path),
-    }
     config = {
         "horizons": list(horizons),
         "past_horizon": past_horizon,
@@ -284,6 +260,45 @@ def relation_spillover_one(
         "tiers": sorted(tiers) if tiers else None,
         "max_row_groups": max_row_groups,
     }
+
+    if not returns_path.exists():
+        upstream = read_json(returns_manifest)
+        if upstream and upstream.get("status") == "empty" and upstream.get("stage_contract_version") == THEME_RETURNS_CONTRACT:
+            inputs = {
+                "relation_edges": file_fingerprint(part.base),
+                "theme_returns_manifest": file_fingerprint(returns_manifest),
+            }
+            if skip_existing and stage_checkpoint_valid(
+                output_dir / "manifest.json",
+                stage="relation_spillover",
+                contract_version=RELATION_SPILLOVER_CONTRACT,
+                inputs=inputs,
+                config=config,
+                output_path=output_path,
+            ):
+                return {"stage": "relation_spillover", "status": "skipped", "date": part.date, "layer_id": part.layer_id, "scale": part.scale}
+            output_path.unlink(missing_ok=True)
+            metadata = {
+                "stage": "relation_spillover",
+                "stage_contract_version": RELATION_SPILLOVER_CONTRACT,
+                "status": "empty",
+                "date": part.date,
+                "layer_id": part.layer_id,
+                "scale": part.scale,
+                "output_rows": 0,
+                "write_batches": 0,
+                "inputs": inputs,
+                "config": config,
+                "upstream_status": "empty_theme_returns",
+                "elapsed_sec": round(time.time() - started, 3),
+            }
+            write_manifest(output_dir, metadata)
+            return metadata
+        if upstream and upstream.get("status") == "complete":
+            raise FileNotFoundError(f"theme return manifest is complete but output is missing: {returns_path}")
+        return {"stage": "relation_spillover", "status": "missing_theme_returns", "date": part.date, "layer_id": part.layer_id, "scale": part.scale}
+
+    inputs = {"relation_edges": file_fingerprint(part.base), "theme_returns": file_fingerprint(returns_path)}
     if skip_existing and stage_checkpoint_valid(
         output_dir / "manifest.json",
         stage="relation_spillover",
