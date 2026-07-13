@@ -27,7 +27,7 @@ def pool(parts: list[Part], workers: int, function, *args) -> list[dict]:
         function,
         *args,
         max_in_flight=worker_count * 2,
-        max_tasks_per_child=None,
+        max_tasks_per_child=8,
     )
 
 
