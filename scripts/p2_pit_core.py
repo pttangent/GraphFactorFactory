@@ -1,23 +1,10 @@
 #!/usr/bin/env python3
-"""Point-in-time-safe P2 theme/relation alpha pipeline.
-
-The pipeline deliberately separates two contracts:
-
-* intraday: one feature row per decision_time and theme; all normalization and
-  evaluation are cross-sectional inside that snapshot; only minute targets
-  whose entry_time is strictly after feature_time are accepted.
-* daily: full-session aggregation is allowed, but the feature is available only
-  after the final snapshot and only next-open-executable daily labels are
-  accepted (for example label_1d_open).
-"""
+"""Point-in-time-safe P2 theme/relation alpha pipeline core utilities."""
 from __future__ import annotations
 
-import argparse
-import concurrent.futures as cf
 import json
 import os
 import re
-import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -136,23 +123,28 @@ def discover(
         if scales and scale not in scales:
             continue
         parts.append(Part(date, layer, scale, path))
-    parts.sort(key=lambda p: p.base.stat().st_size, reverse=True)
+    parts.sort(key=lambda part: part.base.stat().st_size, reverse=True)
     return parts
+
+
+def _arrow_to_pandas(table: pa.Table) -> pd.DataFrame:
+    return table.to_pandas(split_blocks=True, self_destruct=True)
 
 
 def read_partition(path: str | Path, columns: Iterable[str] | None = None, max_row_groups: int | None = None) -> pd.DataFrame:
     parquet = pq.ParquetFile(path)
     available = set(parquet.schema.names)
-    selected = None if columns is None else [c for c in columns if c in available]
+    selected = None if columns is None else [column for column in columns if column in available]
     if selected == []:
         return pd.DataFrame()
     if max_row_groups is None:
-        return pd.read_parquet(path, columns=selected)
-    tables = [
-        parquet.read_row_group(i, columns=selected)
-        for i in range(min(max_row_groups, parquet.metadata.num_row_groups))
-    ]
-    return pa.concat_tables(tables).to_pandas() if tables else pd.DataFrame()
+        table = parquet.read(columns=selected, use_threads=False)
+    else:
+        row_groups = list(range(min(max_row_groups, parquet.metadata.num_row_groups)))
+        if not row_groups:
+            return pd.DataFrame()
+        table = parquet.read_row_groups(row_groups, columns=selected, use_threads=False)
+    return _arrow_to_pandas(table)
 
 
 def write_parquet_atomic(frame: pd.DataFrame, path: str | Path) -> None:
@@ -161,7 +153,9 @@ def write_parquet_atomic(frame: pd.DataFrame, path: str | Path) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     if temporary.exists():
         temporary.unlink()
-    pq.write_table(pa.Table.from_pandas(frame, preserve_index=False), temporary, compression="zstd")
+    table = pa.Table.from_pandas(frame, preserve_index=False)
+    pq.write_table(table, temporary, compression="zstd", use_dictionary=True)
+    del table
     temporary.replace(path)
 
 
@@ -202,12 +196,13 @@ def stream_frames(path: str | Path, frames: Iterable[pd.DataFrame | None]) -> tu
             table = pa.Table.from_pandas(frame, preserve_index=False)
             if writer is None:
                 schema = table.schema
-                writer = pq.ParquetWriter(temporary, schema, compression="zstd")
+                writer = pq.ParquetWriter(temporary, schema, compression="zstd", use_dictionary=True)
             elif table.schema != schema:
                 table = table.cast(schema)
             writer.write_table(table)
             rows += len(frame)
             batches += 1
+            del table
     finally:
         if writer is not None:
             writer.close()
@@ -233,7 +228,7 @@ def load_labels(path: str | Path, horizons: list[str]) -> pd.DataFrame:
     """Load targets and construct only fully-realized past intraday returns."""
     parquet = pq.ParquetFile(path)
     names = set(parquet.schema.names)
-    valid = [h for h in horizons if f"label_{h}" in names]
+    valid = [horizon for horizon in horizons if f"label_{horizon}" in names]
     if not valid:
         raise ValueError(f"no requested label columns in {path}; requested={horizons}")
 
@@ -251,7 +246,7 @@ def load_labels(path: str | Path, horizons: list[str]) -> pd.DataFrame:
             if candidate in names:
                 columns.append(candidate)
     columns = list(dict.fromkeys(columns))
-    frame = pd.read_parquet(path, columns=columns)
+    frame = _arrow_to_pandas(parquet.read(columns=columns, use_threads=False))
     frame["decision_time"] = pd.to_datetime(frame["decision_time"], utc=True, errors="coerce")
     frame["symbol_id"] = pd.to_numeric(frame["symbol_id"], errors="coerce").astype("Int64")
     frame = frame.dropna(subset=["decision_time", "symbol_id"]).copy()
@@ -287,7 +282,7 @@ def load_labels(path: str | Path, horizons: list[str]) -> pd.DataFrame:
             rename[entry_column] = f"past_entry_time_{horizon}"
         past = past.rename(columns=rename)
         past[f"past_exit_time_{horizon}"] = past["decision_time"]
-        frame = frame.merge(past, on=["decision_time", "symbol_id"], how="left", validate="many_to_one")
+        frame = frame.merge(past, on=["decision_time", "symbol_id"], how="left", validate="many_to_one", copy=False)
         available = frame[f"past_exit_time_{horizon}"].notna()
         if available.any() and not (frame.loc[available, f"past_exit_time_{horizon}"] <= frame.loc[available, "decision_time"]).all():
             raise AssertionError(f"past_label_{horizon} contains a value unavailable at decision_time")
