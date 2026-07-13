@@ -11,6 +11,7 @@ from pathlib import Path
 from p2_parallel_runtime import bounded_thread_map, run_process_tree
 
 P1_CONTRACT_VERSION = "p1-streaming-v2"
+P2_MEASURED_GB_PER_PROCESS = 3.8
 
 
 def parse_csv(value: str | None) -> set[str] | None:
@@ -86,7 +87,9 @@ def run_one(
         "OMP_NUM_THREADS": "1",
         "MKL_NUM_THREADS": "1",
         "OPENBLAS_NUM_THREADS": "1",
+        "NUMEXPR_NUM_THREADS": "1",
         "ARROW_NUM_THREADS": "1",
+        "POLARS_MAX_THREADS": "1",
     })
     return_code = run_process_tree(command, env=environment)
     result = {
@@ -115,7 +118,12 @@ def main() -> None:
     parser.add_argument("--cores", type=int, default=24)
     parser.add_argument("--ram-gb", type=float, default=128.0)
     parser.add_argument("--reserve-ram-gb", type=float, default=24.0)
-    parser.add_argument("--gb-per-worker", type=float, default=4.5)
+    parser.add_argument(
+        "--gb-per-worker",
+        type=float,
+        default=P2_MEASURED_GB_PER_PROCESS,
+        help="Defaults to the ce6e2f3 24-process scheduler memory standard.",
+    )
     parser.add_argument("--dates")
     parser.add_argument("--layers")
     parser.add_argument("--scales")
@@ -137,15 +145,18 @@ def main() -> None:
     out_root.mkdir(parents=True, exist_ok=True)
     plan = {
         "p1_contract_version": P1_CONTRACT_VERSION,
+        "memory_reference": "ce6e2f3_p2_scheduler_24_processes_healthy_60gb_observed",
         "shards": len(shards),
         "workers": workers,
         "cores": args.cores,
         "ram_gb": args.ram_gb,
         "reserve_ram_gb": args.reserve_ram_gb,
+        "schedulable_ram_gb": (args.ram_gb - args.reserve_ram_gb) * 0.90,
         "gb_per_worker": args.gb_per_worker,
         "estimated_peak_ram_gb": workers * args.gb_per_worker,
         "largest_shard_mb": round(shards[0].stat().st_size / 1024 / 1024, 2),
         "input_mode": "streamed_snapshot_groups",
+        "maximum_shards_in_flight": workers,
     }
     (out_root / "p1_schedule_plan.json").write_text(json.dumps(plan, indent=2), encoding="utf-8")
     print(json.dumps(plan, indent=2), flush=True)
