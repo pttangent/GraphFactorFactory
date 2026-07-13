@@ -48,6 +48,7 @@ jobs:
           scripts/p2_eval_layout.py
           scripts/p2_parallel_runtime.py
           scripts/p2_streaming_io.py
+          scripts/p2_pit_core.py
           scripts/p2_pit_theme_streaming.py
           scripts/p2_theme_date_runner.py
           scripts/p2_pit_runner_streaming.py
