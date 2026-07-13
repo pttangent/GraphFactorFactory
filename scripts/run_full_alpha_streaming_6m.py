@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Six-month local/NAS runner for the PIT-safe P0/P2 pipeline.
 
-The production path scans each canonical trade date once and writes only final
-P0 factors. Completed months are
-archived to NAS, checkpointed, and removed from the local NVMe.
+Each month is copied locally, processed with source-aware checkpoints, archived
+atomically, and removed from the NVMe. Global evaluation merges small monthly
+reducer states instead of rescanning all feature Parquet files over the NAS.
 """
 from __future__ import annotations
 
@@ -36,6 +36,8 @@ P0_DATE_WORKERS = 8
 P0_BATCH_SIZE = 500_000
 P0_MIN_FREE_GB = 50.0
 MIN_FREE_GB_BEFORE_MONTH = 100.0
+TASKS_PER_CHILD = 8
+PARQUET_TARGET_ROWS = 100_000
 
 DATE_PARTITION_STAGES = [
     "p0_node_features",
@@ -52,7 +54,8 @@ EVAL_STAGES = ["p0_alpha", "intraday_relation_eval", "daily_relation_eval"]
 
 def run(command: list[str]) -> None:
     environment = os.environ.copy()
-    environment.setdefault("GFF_MAX_TASKS_PER_CHILD", "1")
+    environment["GFF_MAX_TASKS_PER_CHILD"] = str(TASKS_PER_CHILD)
+    environment["GFF_PARQUET_TARGET_ROWS"] = str(PARQUET_TARGET_ROWS)
     return_code = run_process_tree(command, env=environment)
     if return_code != 0:
         raise RuntimeError(f"command failed with code {return_code}: {' '.join(command)}")
@@ -93,8 +96,7 @@ def ensure_free_space(path: Path, minimum_free_gb: float) -> float:
 
 
 def directory_stats(path: Path) -> tuple[int, int]:
-    files = 0
-    size = 0
+    files = size = 0
     if not path.exists():
         return files, size
     for item in path.rglob("*"):
@@ -105,11 +107,11 @@ def directory_stats(path: Path) -> tuple[int, int]:
 
 
 def source_month_size_bytes(month: str) -> int:
-    total = 0
-    for root in (NAS_P0_ROOT, NAS_P1_ROOT):
-        for directory in root.glob(f"date={month}-*"):
-            total += directory_stats(directory)[1]
-    return total
+    return sum(
+        directory_stats(directory)[1]
+        for root in (NAS_P0_ROOT, NAS_P1_ROOT)
+        for directory in root.glob(f"date={month}-*")
+    )
 
 
 def file_fingerprint(path: Path) -> dict:
@@ -191,7 +193,7 @@ def inject_month_labels(month: str) -> None:
         raise RuntimeError(f"no daily labels injected for {month}")
     status = label_status_path(month)
     status.parent.mkdir(parents=True, exist_ok=True)
-    temporary = status.with_suffix(".json.tmp")
+    temporary = Path(str(status) + ".tmp")
     temporary.write_text(
         json.dumps(
             {
@@ -250,6 +252,12 @@ def run_p2_month(month: str) -> None:
             str(P0_BATCH_SIZE),
             "--p0-min-free-gb",
             str(P0_MIN_FREE_GB),
+            "--tasks-per-child",
+            str(TASKS_PER_CHILD),
+            "--parquet-target-rows",
+            str(PARQUET_TARGET_ROWS),
+            "--eval-csv-mode",
+            "none",
             "--skip-existing",
         ]
     )
@@ -306,7 +314,7 @@ def archive_month_outputs(month: str) -> None:
 
     status_path = month_status_path(month)
     status_path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = status_path.with_suffix(".json.tmp")
+    temporary = Path(str(status_path) + ".tmp")
     temporary.write_text(
         json.dumps(
             {
@@ -342,33 +350,18 @@ def purge_local_month_outputs(month: str) -> None:
 
 
 def run_global_evaluation() -> None:
-    eval_workers = 12
-    run(
-        [
-            sys.executable,
-            "scripts/p2_alpha_daily_features.py",
-            "evaluate-intraday",
-            "--features-root",
-            str(NAS_P2_OUT / "intraday_relation_features"),
-            "--out-dir",
-            str(NAS_P2_OUT / "intraday_relation_eval" / "global"),
-            "--workers",
-            str(eval_workers),
-        ]
-    )
-    run(
-        [
-            sys.executable,
-            "scripts/p2_alpha_daily_features.py",
-            "evaluate-daily",
-            "--features-root",
-            str(NAS_P2_OUT / "daily_relation_features"),
-            "--out-dir",
-            str(NAS_P2_OUT / "daily_relation_eval" / "global"),
-            "--workers",
-            str(eval_workers),
-        ]
-    )
+    for mode in ("intraday", "daily"):
+        run(
+            [
+                sys.executable,
+                "scripts/p2_alpha_daily_features.py",
+                f"merge-{mode}-eval",
+                "--evaluation-root",
+                str(NAS_P2_OUT / f"{mode}_relation_eval"),
+                "--out-dir",
+                str(NAS_P2_OUT / f"{mode}_relation_eval" / "global"),
+            ]
+        )
 
 
 def main() -> None:
