@@ -9,7 +9,7 @@ from pathlib import Path
 import pandas as pd
 import pyarrow.parquet as pq
 
-from p2_parallel_runtime import bounded_thread_map
+from p2_parallel_runtime import bounded_thread_map_ordered
 from p2_pit_core import (
     Part,
     is_complete,
@@ -83,7 +83,7 @@ def build_theme_returns_one(
         return _aggregate_theme_returns(membership, _lookup_indexed(labels_indexed, decision_time), horizons)
 
     if inner_workers > 1:
-        frames: Iterable[pd.DataFrame | None] = bounded_thread_map(
+        frames: Iterable[pd.DataFrame | None] = bounded_thread_map_ordered(
             groups(), inner_workers, one, max_in_flight=inner_workers * 2
         )
     else:
@@ -100,6 +100,7 @@ def build_theme_returns_one(
         "output": str(output_path),
         "past_return_availability": "actual_label_exit_time",
         "input_mode": "parquet_batch_time_group_stream",
+        "output_order": "decision_time_ascending",
         "maximum_time_groups_in_flight": max(1, inner_workers * 2),
         "elapsed_sec": round(time.time() - started, 3),
     }
@@ -233,7 +234,7 @@ def relation_spillover_one(
         return output
 
     if inner_workers > 1:
-        frames: Iterable[pd.DataFrame | None] = bounded_thread_map(
+        frames: Iterable[pd.DataFrame | None] = bounded_thread_map_ordered(
             inputs(), inner_workers, one, max_in_flight=inner_workers * 2
         )
     else:
@@ -249,6 +250,7 @@ def relation_spillover_one(
         "relation_semantics": "symmetric_neighbor_diffusion",
         "symmetric_expansion_scope": "single_snapshot",
         "input_mode": "dual_sorted_time_stream",
+        "output_order": "decision_time_ascending",
         "maximum_time_groups_in_flight": max(1, inner_workers * 2),
         "output_rows": rows,
         "write_batches": batches,
