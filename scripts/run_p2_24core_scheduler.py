@@ -22,9 +22,7 @@ THREAD_CAPS = {
     "ARROW_NUM_THREADS": "1",
     "POLARS_MAX_THREADS": "1",
     "PYTHONUNBUFFERED": "1",
-    "GFF_MAX_TASKS_PER_CHILD": "1",
 }
-
 BASE_GB_PER_PROCESS = {
     "p0-direct-date": 6.0,
     "p0-node-features": 3.8,
@@ -66,9 +64,8 @@ def _nested_shape(target: int, outer_cap: int, requested_inner: int, inner_cap: 
     best = (1, 1, 1)
     for inner in range(1, inner_cap + 1):
         outer = max(1, min(outer_cap, target // inner))
-        slots = outer * inner
-        candidate = (slots, outer, inner)
-        if slots <= target and candidate > best:
+        candidate = (outer * inner, outer, inner)
+        if candidate[0] <= target and candidate > best:
             best = candidate
     return best[1], best[2]
 
@@ -113,7 +110,7 @@ def build_plan(
         "p0-node-features": simple("p0-node-features", "legacy physical-shard compatibility"),
         "p0-edge-spillover": simple("p0-edge-spillover", "legacy physical-shard compatibility"),
         "p0-graph-state": simple("p0-graph-state", "legacy physical-shard compatibility"),
-        "p0-eval": simple("p0-eval", "streamed metric shards and online reducer"),
+        "p0-eval": simple("p0-eval", "resumable partition metrics plus small reducer states"),
         "build-theme-returns": StagePlan(
             "build-theme-returns",
             theme_outer,
@@ -121,7 +118,7 @@ def build_plan(
             theme_outer * theme_inner,
             theme_memory,
             theme_outer * theme_memory,
-            "streamed P1 memberships plus bounded snapshot threads",
+            "streamed memberships, one-label-table worker cache, ordered bounded snapshot threads",
         ),
         "relation-spillover": StagePlan(
             "relation-spillover",
@@ -130,17 +127,20 @@ def build_plan(
             relation_outer * relation_inner,
             relation_memory,
             relation_outer * relation_memory,
-            "dual sorted time streams; snapshot-local symmetric expansion",
+            "dual sorted time streams and snapshot-local symmetric expansion",
         ),
         "intraday-relation-features": simple(
             "intraday-relation-features",
-            "snapshot-streamed feature transforms",
+            "snapshot-streamed feature transforms with source-aware checkpoints",
         ),
         "daily-relation-features": simple(
             "daily-relation-features",
-            "full-session temporal episode aggregation",
+            "date-layer-scale full-session aggregation with bounded outer processes",
         ),
-        "p2-eval": simple("p2-eval", "partition metric shards without global concat"),
+        "p2-eval": simple(
+            "p2-eval",
+            "resumable partition metric shards and parallel local summary reduction",
+        ),
     }
 
 
@@ -205,6 +205,13 @@ def scope_name(dates: str | None) -> str:
     return next(iter(months)).replace("-", "") if len(months) == 1 else "selected"
 
 
+def single_month(dates: str | None) -> str | None:
+    if not dates:
+        return None
+    months = {value.strip()[:7] for value in dates.split(",") if value.strip()}
+    return next(iter(months)) if len(months) == 1 else None
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="PIT-safe 24-core / 128GB alpha scheduler")
     parser.add_argument("--p0-root")
@@ -231,27 +238,16 @@ def main() -> None:
     parser.add_argument("--p0-batch-size", type=int, default=500_000)
     parser.add_argument("--p0-min-free-gb", type=float, default=50.0)
     parser.add_argument("--p0-disk-check-every", type=int, default=25)
-    parser.add_argument(
-        "--profile",
-        choices=["safe", "balanced", "aggressive", "max"],
-        default="balanced",
-    )
+    parser.add_argument("--tasks-per-child", type=int, default=8)
+    parser.add_argument("--parquet-target-rows", type=int, default=100_000)
+    parser.add_argument("--eval-csv-mode", choices=["none", "sharded", "single"], default="none")
+    parser.add_argument("--profile", choices=["safe", "balanced", "aggressive", "max"], default="balanced")
     parser.add_argument(
         "--stage",
         choices=[
-            "all",
-            "p0",
-            "p0-node",
-            "p0-edge",
-            "p0-graph",
-            "p0-eval",
-            "theme",
-            "relation",
-            "intraday",
-            "daily",
-            "intraday-eval",
-            "daily-eval",
-            "eval",
+            "all", "p0", "p0-node", "p0-edge", "p0-graph", "p0-eval",
+            "theme", "relation", "intraday", "daily",
+            "intraday-eval", "daily-eval", "eval",
         ],
         default="all",
     )
@@ -262,23 +258,16 @@ def main() -> None:
 
     if not (0 < args.target_cpu <= 1.0):
         raise SystemExit("--target-cpu must be in (0, 1.0]")
-    if args.inner_workers < 0:
-        raise SystemExit("--inner-workers must be >=0")
+    if args.inner_workers < 0 or args.tasks_per_child < 0:
+        raise SystemExit("--inner-workers and --tasks-per-child must be >=0")
     if args.ram_gb <= args.reserve_ram_gb:
         raise SystemExit("--ram-gb must exceed --reserve-ram-gb")
-    if args.p0_date_workers < 1:
-        raise SystemExit("--p0-date-workers must be >=1")
+    if args.p0_date_workers < 1 or args.parquet_target_rows < 1:
+        raise SystemExit("worker counts and parquet target rows must be positive")
 
     root = Path(args.p2_root)
     root.mkdir(parents=True, exist_ok=True)
-    plan = build_plan(
-        args.cores,
-        args.target_cpu,
-        args.profile,
-        args.inner_workers,
-        args.ram_gb,
-        args.reserve_ram_gb,
-    )
+    plan = build_plan(args.cores, args.target_cpu, args.profile, args.inner_workers, args.ram_gb, args.reserve_ram_gb)
     direct_cap = plan["p0-direct-date"].workers
     p0_date_workers = max(1, min(args.p0_date_workers, direct_cap, args.cores))
     payload = {
@@ -289,7 +278,11 @@ def main() -> None:
         "ram_gb": args.ram_gb,
         "reserve_ram_gb": args.reserve_ram_gb,
         "schedulable_ram_gb": (args.ram_gb - args.reserve_ram_gb) * 0.90,
-        "worker_recycling": "one_date_or_partition_per_process",
+        "worker_recycling": {
+            "tasks_per_child": args.tasks_per_child,
+            "zero_means_pool_lifetime": True,
+        },
+        "parquet_target_rows": args.parquet_target_rows,
         "p0_execution": {
             "mode": "canonical_date_single_pass",
             "physical_alpha_shards": False,
@@ -307,70 +300,51 @@ def main() -> None:
         },
         "created_at_epoch": time.time(),
     }
-    (root / "p2_24core_schedule_plan.json").write_text(
-        json.dumps(payload, indent=2, ensure_ascii=False),
-        encoding="utf-8",
-    )
+    (root / "p2_24core_schedule_plan.json").write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
     print(json.dumps(payload, indent=2, ensure_ascii=False), flush=True)
 
     environment = os.environ.copy()
     environment.update(THREAD_CAPS)
+    environment["GFF_MAX_TASKS_PER_CHILD"] = str(args.tasks_per_child)
+    environment["GFF_PARQUET_TARGET_ROWS"] = str(args.parquet_target_rows)
     python = sys.executable
     common = common_filters(args)
 
     if args.stage in {"all", "p0", "p0-node", "p0-edge", "p0-graph"}:
         if not args.p0_root:
             raise SystemExit("--p0-root required for P0 stages")
-        feature_map = {
-            "p0-node": "node",
-            "p0-edge": "spillover",
-            "p0-graph": "graph",
-        }
+        feature_map = {"p0-node": "node", "p0-edge": "spillover", "p0-graph": "graph"}
         features = feature_map.get(args.stage, "node,spillover,graph")
         command = [
-            python,
-            args.p0_script,
-            "direct",
-            "--p0-root",
-            args.p0_root,
-            "--labels-root",
-            args.labels_root,
-            "--out-root",
-            str(root),
-            "--features",
-            features,
-            "--past-horizon",
-            args.past_horizon,
-            "--workers",
-            str(p0_date_workers),
-            "--batch-size",
-            str(args.p0_batch_size),
-            "--min-free-gb",
-            str(args.p0_min_free_gb),
-            "--disk-check-every",
-            str(args.p0_disk_check_every),
+            python, args.p0_script, "direct",
+            "--p0-root", args.p0_root,
+            "--labels-root", args.labels_root,
+            "--out-root", str(root),
+            "--features", features,
+            "--past-horizon", args.past_horizon,
+            "--workers", str(p0_date_workers),
+            "--batch-size", str(args.p0_batch_size),
+            "--min-free-gb", str(args.p0_min_free_gb),
+            "--disk-check-every", str(args.p0_disk_check_every),
         ] + p0_filters(args)
         run_command(command, environment, args.dry_run)
 
     if args.stage in {"all", "p0", "p0-eval"}:
-        month = args.dates.split(",")[0][:7] if args.dates else None
         eval_dir = root / "p0_alpha" / scope_name(args.dates)
-        if not (args.skip_existing and (eval_dir / "p0_alpha_metrics.parquet").exists()):
-            stage = plan["p0-eval"]
-            command = [
-                python,
-                args.p0_script,
-                "eval-p0",
-                "--p0-alpha-root",
-                str(root),
-                "--out-dir",
-                str(eval_dir),
-                "--workers",
-                str(stage.workers),
-            ]
-            if month:
-                command += ["--month", month]
-            run_command(command, environment, args.dry_run)
+        stage = plan["p0-eval"]
+        command = [
+            python, args.p0_script, "eval-p0",
+            "--p0-alpha-root", str(root),
+            "--out-dir", str(eval_dir),
+            "--workers", str(stage.workers),
+            "--csv-mode", args.eval_csv_mode,
+        ]
+        month = single_month(args.dates)
+        if month:
+            command += ["--month", month]
+        if args.skip_existing:
+            command.append("--skip-existing")
+        run_command(command, environment, args.dry_run)
 
     if args.stage in {"all", "theme"}:
         if not args.p1_root:
@@ -378,90 +352,61 @@ def main() -> None:
         stage = plan["build-theme-returns"]
         run_command(
             [
-                python,
-                args.p2_script,
-                "build-theme-returns",
-                "--p1-root",
-                args.p1_root,
-                "--labels-root",
-                args.labels_root,
-                "--out-root",
-                str(root / "theme_returns"),
-                "--workers",
-                str(stage.workers),
-                "--inner-workers",
-                str(stage.inner_workers),
-            ]
-            + common,
+                python, args.p2_script, "build-theme-returns",
+                "--p1-root", args.p1_root,
+                "--labels-root", args.labels_root,
+                "--out-root", str(root / "theme_returns"),
+                "--workers", str(stage.workers),
+                "--inner-workers", str(stage.inner_workers),
+            ] + common,
             environment,
             args.dry_run,
         )
+
     if args.stage in {"all", "relation"}:
         if not args.p1_root:
             raise SystemExit("--p1-root required for relation stage")
         stage = plan["relation-spillover"]
         command = [
-            python,
-            args.p2_script,
-            "relation-spillover",
-            "--p1-root",
-            args.p1_root,
-            "--theme-returns-root",
-            str(root / "theme_returns"),
-            "--out-root",
-            str(root / "relation_spillover"),
-            "--past-horizon",
-            args.past_horizon,
-            "--workers",
-            str(stage.workers),
-            "--inner-workers",
-            str(stage.inner_workers),
+            python, args.p2_script, "relation-spillover",
+            "--p1-root", args.p1_root,
+            "--theme-returns-root", str(root / "theme_returns"),
+            "--out-root", str(root / "relation_spillover"),
+            "--past-horizon", args.past_horizon,
+            "--workers", str(stage.workers),
+            "--inner-workers", str(stage.inner_workers),
         ] + common
         command += csv_arg("--tiers", args.tiers)
         run_command(command, environment, args.dry_run)
+
     if args.stage in {"all", "intraday"}:
         stage = plan["intraday-relation-features"]
         run_command(
             [
-                python,
-                args.p2_script,
-                "intraday-relation-features",
-                "--signals-root",
-                str(root / "relation_spillover"),
-                "--out-root",
-                str(root / "intraday_relation_features"),
-                "--workers",
-                str(stage.workers),
-                "--underreaction-past-horizon",
-                args.underreaction_past_horizon,
-            ]
-            + common,
+                python, args.p2_script, "intraday-relation-features",
+                "--signals-root", str(root / "relation_spillover"),
+                "--out-root", str(root / "intraday_relation_features"),
+                "--workers", str(stage.workers),
+                "--underreaction-past-horizon", args.underreaction_past_horizon,
+            ] + common,
             environment,
             args.dry_run,
         )
+
     if args.stage in {"all", "daily"}:
         if not args.p1_root:
             raise SystemExit("--p1-root required for daily temporal episode identity")
         stage = plan["daily-relation-features"]
         run_command(
             [
-                python,
-                args.p2_script,
-                "daily-relation-features",
-                "--signals-root",
-                str(root / "relation_spillover"),
-                "--p1-root",
-                args.p1_root,
-                "--out-root",
-                str(root / "daily_relation_features"),
-                "--workers",
-                str(stage.workers),
-                "--late-minutes",
-                str(args.late_minutes),
-                "--underreaction-past-horizon",
-                args.underreaction_past_horizon,
-            ]
-            + common,
+                python, args.p2_script, "daily-relation-features",
+                "--signals-root", str(root / "relation_spillover"),
+                "--p1-root", args.p1_root,
+                "--out-root", str(root / "daily_relation_features"),
+                "--workers", str(stage.workers),
+                "--late-minutes", str(args.late_minutes),
+                "--underreaction-past-horizon", args.underreaction_past_horizon,
+            ] + common,
             environment,
             args.dry_run,
         )
@@ -469,40 +414,29 @@ def main() -> None:
     eval_scope = scope_name(args.dates)
     if args.stage in {"all", "eval", "intraday-eval"}:
         stage = plan["p2-eval"]
-        run_command(
-            [
-                python,
-                args.p2_script,
-                "evaluate-intraday",
-                "--features-root",
-                str(root / "intraday_relation_features"),
-                "--out-dir",
-                str(root / "intraday_relation_eval" / eval_scope),
-                "--workers",
-                str(stage.workers),
-            ]
-            + eval_filters(args),
-            environment,
-            args.dry_run,
-        )
+        command = [
+            python, args.p2_script, "evaluate-intraday",
+            "--features-root", str(root / "intraday_relation_features"),
+            "--out-dir", str(root / "intraday_relation_eval" / eval_scope),
+            "--workers", str(stage.workers),
+            "--csv-mode", args.eval_csv_mode,
+        ] + eval_filters(args)
+        if args.skip_existing:
+            command.append("--skip-existing")
+        run_command(command, environment, args.dry_run)
+
     if args.stage in {"all", "eval", "daily-eval"}:
         stage = plan["p2-eval"]
-        run_command(
-            [
-                python,
-                args.p2_script,
-                "evaluate-daily",
-                "--features-root",
-                str(root / "daily_relation_features"),
-                "--out-dir",
-                str(root / "daily_relation_eval" / eval_scope),
-                "--workers",
-                str(stage.workers),
-            ]
-            + eval_filters(args),
-            environment,
-            args.dry_run,
-        )
+        command = [
+            python, args.p2_script, "evaluate-daily",
+            "--features-root", str(root / "daily_relation_features"),
+            "--out-dir", str(root / "daily_relation_eval" / eval_scope),
+            "--workers", str(stage.workers),
+            "--csv-mode", args.eval_csv_mode,
+        ] + eval_filters(args)
+        if args.skip_existing:
+            command.append("--skip-existing")
+        run_command(command, environment, args.dry_run)
 
 
 if __name__ == "__main__":
