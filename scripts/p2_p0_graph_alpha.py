@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Point-in-time-safe P0 graph alpha extraction and evaluation."""
+"""Point-in-time-safe, snapshot-streamed P0 graph alpha extraction."""
 from __future__ import annotations
 
 import argparse
@@ -11,7 +11,6 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import pyarrow.parquet as pq
 
 from p2_parallel_runtime import collect_process_map
 from p2_alpha_pit_features import (
@@ -21,12 +20,13 @@ from p2_alpha_pit_features import (
     csvset,
     ext,
     is_complete,
+    iter_time_groups,
     label_path,
     load_labels,
     stream_frames,
     write_manifest,
-    write_parquet_atomic,
 )
+from p2_p0_eval_streaming import evaluate_p0_streaming
 
 
 @dataclass(frozen=True)
@@ -37,21 +37,42 @@ class Part:
     base: Path
 
 
+EDGE_COLUMNS = [
+    "decision_time",
+    "window_start",
+    "window_end",
+    "layer_id",
+    "scale",
+    "src_id",
+    "dst_id",
+    "weight",
+]
+
+
 def discover(root: str | Path, dates=None, layers=None, scales=None) -> list[Part]:
-    parts = []
+    parts: list[Part] = []
+    unpartitioned: list[Path] = []
     for path in Path(root).rglob("edges.parquet"):
         date, layer, scale = ext(path, "date"), ext(path, "layer_id"), ext(path, "scale")
         if not date:
             continue
-        layer = layer or "all"
-        scale = scale or "default"
         if dates and date not in dates:
             continue
-        if layers and layer not in layers and layer != "all":
+        if not layer or not scale:
+            unpartitioned.append(path)
             continue
-        if scales and scale not in scales and scale != "default":
+        if layers and layer not in layers:
+            continue
+        if scales and scale not in scales:
             continue
         parts.append(Part(date, layer, scale, path))
+    if not parts and unpartitioned:
+        sample = ", ".join(str(path) for path in unpartitioned[:3])
+        raise ValueError(
+            "P0 alpha requires physical date/layer/scale shards; "
+            f"found only unpartitioned edges such as {sample}. "
+            "Run shard_p0_edges_by_layer_scale.py first."
+        )
     return sorted(parts, key=lambda part: part.base.stat().st_size, reverse=True)
 
 
@@ -67,7 +88,13 @@ def normalize_edges(frame: pd.DataFrame, part: Part) -> pd.DataFrame:
         frame["layer_id"] = part.layer_id
     if "scale" not in frame:
         frame["scale"] = part.scale
-    frame["weight"] = pd.to_numeric(frame.get("weight", 0), errors="coerce").fillna(0.0)
+    frame["layer_id"] = frame["layer_id"].astype(str)
+    frame["scale"] = frame["scale"].astype(str)
+    if not frame["layer_id"].eq(str(part.layer_id)).all():
+        raise ValueError(f"mixed layer_id inside physical shard {part.base}")
+    if not frame["scale"].eq(str(part.scale)).all():
+        raise ValueError(f"mixed scale inside physical shard {part.base}")
+    frame["weight"] = pd.to_numeric(frame.get("weight", 0), errors="coerce").fillna(0.0).astype("float32")
     frame["abs_weight"] = frame["weight"].abs()
     if "window_end" in frame:
         frame["window_end"] = pd.to_datetime(frame["window_end"], utc=True, errors="coerce")
@@ -76,176 +103,249 @@ def normalize_edges(frame: pd.DataFrame, part: Part) -> pd.DataFrame:
     return frame
 
 
-def read_row_group(parquet: pq.ParquetFile, index: int) -> pd.DataFrame:
-    wanted = ["decision_time", "window_start", "window_end", "layer_id", "scale", "src_id", "dst_id", "weight"]
-    columns = [column for column in wanted if column in parquet.schema.names]
-    return parquet.read_row_group(index, columns=columns, use_threads=False).to_pandas(split_blocks=True, self_destruct=True)
+def _edge_snapshots(part: Part, max_row_groups: int | None):
+    for decision_time, raw in iter_time_groups(
+        part.base,
+        EDGE_COLUMNS,
+        max_row_groups,
+        time_column="decision_time",
+        batch_size=250_000,
+    ):
+        edges = normalize_edges(raw, part)
+        if not edges.empty:
+            yield decision_time, edges
 
 
 def _labels_at(indexed: pd.DataFrame, decision_time: pd.Timestamp) -> pd.DataFrame:
     try:
-        return indexed.loc[[decision_time]]
+        return indexed.loc[[decision_time]].reset_index(drop=True)
     except KeyError:
         return pd.DataFrame(columns=indexed.columns)
 
 
-def node_features_one(part: Part, labels_root: str, output_root: str, horizons: list[str], max_row_groups: int | None, skip_existing: bool = False) -> dict:
+def node_features_one(
+    part: Part,
+    labels_root: str,
+    output_root: str,
+    horizons: list[str],
+    max_row_groups: int | None,
+    skip_existing: bool = False,
+) -> dict:
     started = time.time()
     output_dir = Path(output_root) / f"date={part.date}" / f"layer_id={part.layer_id}" / f"scale={part.scale}"
     output_path = output_dir / "p0_node_features.parquet"
-    if skip_existing and is_complete(output_dir / "manifest.json"):
+    if skip_existing and is_complete(output_dir / "manifest.json") and output_path.exists():
         return {"date": part.date, "layer": part.layer_id, "scale": part.scale, "status": "skipped", "duration": 0}
+
     labels = load_labels(label_path(labels_root, part.date), horizons)
     labels_indexed = labels.set_index("decision_time", drop=False).sort_index()
-    parquet = pq.ParquetFile(part.base)
-    count = parquet.metadata.num_row_groups if max_row_groups is None else min(max_row_groups, parquet.metadata.num_row_groups)
 
     def frames():
-        for index in range(count):
-            edges = normalize_edges(read_row_group(parquet, index), part)
-            if edges.empty:
+        for decision_time, edges in _edge_snapshots(part, max_row_groups):
+            source = (
+                edges.groupby(["decision_time", "layer_id", "scale", "src_id"], sort=False)
+                .agg(
+                    src_edge_count=("dst_id", "size"),
+                    src_weight_sum=("abs_weight", "sum"),
+                    src_weight_mean=("abs_weight", "mean"),
+                    src_weight_max=("abs_weight", "max"),
+                )
+                .reset_index()
+                .rename(columns={"src_id": "symbol_id"})
+            )
+            destination = (
+                edges.groupby(["decision_time", "layer_id", "scale", "dst_id"], sort=False)
+                .agg(
+                    dst_edge_count=("src_id", "size"),
+                    dst_weight_sum=("abs_weight", "sum"),
+                    dst_weight_mean=("abs_weight", "mean"),
+                    dst_weight_max=("abs_weight", "max"),
+                )
+                .reset_index()
+                .rename(columns={"dst_id": "symbol_id"})
+            )
+            features = source.merge(
+                destination,
+                on=["decision_time", "layer_id", "scale", "symbol_id"],
+                how="outer",
+                copy=False,
+            )
+            numeric = [column for column in features if column.endswith(("_count", "_sum", "_mean", "_max"))]
+            features[numeric] = features[numeric].fillna(0)
+            features["p0_total_edge_count"] = features["src_edge_count"] + features["dst_edge_count"]
+            features["p0_total_weight_sum"] = features["src_weight_sum"] + features["dst_weight_sum"]
+            target = _labels_at(labels_indexed, decision_time)
+            if target.empty:
                 continue
-            source = edges.groupby(["decision_time", "layer_id", "scale", "src_id"], sort=False).agg(src_edge_count=("dst_id", "size"), src_weight_sum=("abs_weight", "sum"), src_weight_mean=("abs_weight", "mean"), src_weight_max=("abs_weight", "max")).reset_index().rename(columns={"src_id": "symbol_id"})
-            destination = edges.groupby(["decision_time", "layer_id", "scale", "dst_id"], sort=False).agg(dst_edge_count=("src_id", "size"), dst_weight_sum=("abs_weight", "sum"), dst_weight_mean=("abs_weight", "mean"), dst_weight_max=("abs_weight", "max")).reset_index().rename(columns={"dst_id": "symbol_id"})
-            features = source.merge(destination, on=["decision_time", "layer_id", "scale", "symbol_id"], how="outer", copy=False).fillna(0)
-            features["p0_total_edge_count"] = features.src_edge_count + features.dst_edge_count
-            features["p0_total_weight_sum"] = features.src_weight_sum + features.dst_weight_sum
-            for decision_time, snapshot in features.groupby("decision_time", sort=False):
-                target = _labels_at(labels_indexed, decision_time)
-                if target.empty:
-                    continue
-                output = snapshot.merge(target, on=["decision_time", "symbol_id"], how="inner", copy=False)
-                if not output.empty:
-                    output["pit_audit_pass"] = True
-                    yield output
+            output = features.merge(target, on=["decision_time", "symbol_id"], how="inner", copy=False)
+            if not output.empty:
+                output["pit_audit_pass"] = True
+                yield output
 
     rows, batches = stream_frames(output_path, frames())
-    meta = {"stage": "p0_node_features", "status": "complete" if rows else "empty", "output_rows": rows, "write_batches": batches, "row_groups": count, "elapsed_sec": round(time.time() - started, 3)}
+    meta = {
+        "stage": "p0_node_features",
+        "status": "complete" if rows else "empty",
+        "output_rows": rows,
+        "write_batches": batches,
+        "input_mode": "complete_decision_time_stream",
+        "elapsed_sec": round(time.time() - started, 3),
+    }
     write_manifest(output_dir, meta)
     return meta
 
 
-def edge_spillover_one(part: Part, labels_root: str, output_root: str, horizons: list[str], past_horizon: str, max_row_groups: int | None, skip_existing: bool = False) -> dict:
+def edge_spillover_one(
+    part: Part,
+    labels_root: str,
+    output_root: str,
+    horizons: list[str],
+    past_horizon: str,
+    max_row_groups: int | None,
+    skip_existing: bool = False,
+) -> dict:
     started = time.time()
     output_dir = Path(output_root) / f"date={part.date}" / f"layer_id={part.layer_id}" / f"scale={part.scale}"
     output_path = output_dir / "p0_edge_spillover_features.parquet"
-    if skip_existing and is_complete(output_dir / "manifest.json"):
+    if skip_existing and is_complete(output_dir / "manifest.json") and output_path.exists():
         return {"date": part.date, "layer": part.layer_id, "scale": part.scale, "status": "skipped", "duration": 0}
+
     labels = load_labels(label_path(labels_root, part.date), horizons)
     past = f"past_label_{past_horizon}"
-    if past not in labels:
-        raise ValueError(f"missing {past}")
+    past_exit = f"past_exit_time_{past_horizon}"
+    if past not in labels or past_exit not in labels:
+        raise ValueError(f"missing {past} or {past_exit}")
     labels_indexed = labels.set_index("decision_time", drop=False).sort_index()
     target_columns = [column for column in labels if re.fullmatch(r"label_\d+m", column)]
-    metadata_columns = [column for column in labels if column == "label_entry_time" or re.fullmatch(r"label_(?:entry|exit)_time_\d+m", column)]
-    parquet = pq.ParquetFile(part.base)
-    count = parquet.metadata.num_row_groups if max_row_groups is None else min(max_row_groups, parquet.metadata.num_row_groups)
+    metadata_columns = [
+        column
+        for column in labels
+        if column == "label_entry_time" or re.fullmatch(r"label_(?:entry|exit)_time_\d+m", column)
+    ]
 
     def frames():
-        for index in range(count):
-            edges = normalize_edges(read_row_group(parquet, index), part)
-            if edges.empty:
+        for decision_time, edge_snapshot in _edge_snapshots(part, max_row_groups):
+            subset = _labels_at(labels_indexed, decision_time)
+            if subset.empty:
                 continue
-            for decision_time, edge_snapshot in edges.groupby("decision_time", sort=False):
-                subset = _labels_at(labels_indexed, decision_time)
-                if subset.empty:
-                    continue
-                source_columns = ["decision_time", "symbol_id", past, f"past_exit_time_{past_horizon}"]
-                source = subset[source_columns].rename(columns={"symbol_id": "src_id", past: "src_past_return", f"past_exit_time_{past_horizon}": "src_past_available_time"})
-                rename = {"symbol_id": "dst_id", **{column: "target_" + column.replace("label_", "") for column in target_columns}}
-                for column in metadata_columns:
-                    match = re.fullmatch(r"label_(entry|exit)_time_(\d+m)", column)
-                    if match:
-                        rename[column] = f"target_{match.group(1)}_time_{match.group(2)}"
-                selected = list(dict.fromkeys(["decision_time", "symbol_id"] + target_columns + metadata_columns))
-                target = subset[selected].rename(columns=rename)
-                merged = edge_snapshot.merge(source, on=["decision_time", "src_id"], how="inner", copy=False)
-                if merged.empty:
-                    continue
-                valid = merged.src_past_available_time.notna()
-                if valid.any() and not (merged.loc[valid, "src_past_available_time"] <= merged.loc[valid, "decision_time"]).all():
-                    raise AssertionError("P0 source past return unavailable at decision_time")
-                merged["edge_signal"] = merged.weight * pd.to_numeric(merged.src_past_return, errors="coerce").fillna(0.0)
-                aggregate = merged.groupby(["decision_time", "layer_id", "scale", "dst_id"], sort=False).agg(p0_edge_spillover_signal=("edge_signal", "mean"), p0_edge_spillover_sum=("edge_signal", "sum"), p0_edge_count=("src_id", "size"), p0_edge_abs_weight=("abs_weight", "sum"), p0_edge_mean_abs_weight=("abs_weight", "mean")).reset_index()
-                output = aggregate.merge(target, on=["decision_time", "dst_id"], how="inner", copy=False)
-                if not output.empty:
-                    output["pit_audit_pass"] = True
-                    yield output
+            source = subset[["decision_time", "symbol_id", past, past_exit]].rename(
+                columns={
+                    "symbol_id": "src_id",
+                    past: "src_past_return",
+                    past_exit: "src_past_available_time",
+                }
+            )
+            rename = {
+                "symbol_id": "dst_id",
+                **{column: "target_" + column.replace("label_", "") for column in target_columns},
+            }
+            for column in metadata_columns:
+                match = re.fullmatch(r"label_(entry|exit)_time_(\d+m)", column)
+                if match:
+                    rename[column] = f"target_{match.group(1)}_time_{match.group(2)}"
+            selected = list(dict.fromkeys(["decision_time", "symbol_id"] + target_columns + metadata_columns))
+            target = subset[selected].rename(columns=rename)
+            merged = edge_snapshot.merge(source, on=["decision_time", "src_id"], how="inner", copy=False)
+            if merged.empty:
+                continue
+            valid = merged["src_past_available_time"].notna()
+            if valid.any() and not (
+                merged.loc[valid, "src_past_available_time"] <= merged.loc[valid, "decision_time"]
+            ).all():
+                raise AssertionError("P0 source past return unavailable at decision_time")
+            merged["edge_signal"] = merged["weight"] * pd.to_numeric(
+                merged["src_past_return"], errors="coerce"
+            ).fillna(0.0)
+            aggregate = (
+                merged.groupby(["decision_time", "layer_id", "scale", "dst_id"], sort=False)
+                .agg(
+                    p0_edge_spillover_signal=("edge_signal", "mean"),
+                    p0_edge_spillover_sum=("edge_signal", "sum"),
+                    p0_edge_count=("src_id", "size"),
+                    p0_edge_abs_weight=("abs_weight", "sum"),
+                    p0_edge_mean_abs_weight=("abs_weight", "mean"),
+                )
+                .reset_index()
+            )
+            output = aggregate.merge(target, on=["decision_time", "dst_id"], how="inner", copy=False)
+            if not output.empty:
+                output["pit_audit_pass"] = True
+                yield output
 
     rows, batches = stream_frames(output_path, frames())
-    meta = {"stage": "p0_edge_spillover", "status": "complete" if rows else "empty", "output_rows": rows, "write_batches": batches, "row_groups": count, "past_horizon": past_horizon, "elapsed_sec": round(time.time() - started, 3)}
+    meta = {
+        "stage": "p0_edge_spillover",
+        "status": "complete" if rows else "empty",
+        "output_rows": rows,
+        "write_batches": batches,
+        "past_horizon": past_horizon,
+        "input_mode": "complete_decision_time_stream",
+        "elapsed_sec": round(time.time() - started, 3),
+    }
     write_manifest(output_dir, meta)
     return meta
 
 
-def graph_state_one(part: Part, output_root: str, max_row_groups: int | None, skip_existing: bool = False) -> dict:
+def graph_state_one(
+    part: Part,
+    output_root: str,
+    max_row_groups: int | None,
+    skip_existing: bool = False,
+) -> dict:
     started = time.time()
     output_dir = Path(output_root) / f"date={part.date}" / f"layer_id={part.layer_id}" / f"scale={part.scale}"
-    if skip_existing and is_complete(output_dir / "manifest.json"):
+    output_path = output_dir / "p0_graph_state_features.parquet"
+    if skip_existing and is_complete(output_dir / "manifest.json") and output_path.exists():
         return {"date": part.date, "layer": part.layer_id, "scale": part.scale, "status": "skipped", "duration": 0}
-    parquet = pq.ParquetFile(part.base)
-    count = parquet.metadata.num_row_groups if max_row_groups is None else min(max_row_groups, parquet.metadata.num_row_groups)
-    rows = []
-    for index in range(count):
-        edges = normalize_edges(read_row_group(parquet, index), part)
-        for keys, group in edges.groupby(["decision_time", "layer_id", "scale"], sort=False):
-            nodes = pd.unique(pd.concat([group.src_id, group.dst_id], ignore_index=True))
-            rows.append({"decision_time": keys[0], "layer_id": keys[1], "scale": keys[2], "edge_count": len(group), "active_node_count": len(nodes), "avg_abs_weight": group.abs_weight.mean(), "sum_abs_weight": group.abs_weight.sum(), "max_abs_weight": group.abs_weight.max(), "density_proxy": len(group) / max(len(nodes), 1), "pit_audit_pass": True})
-    output = pd.DataFrame(rows)
-    if not output.empty:
-        write_parquet_atomic(output, output_dir / "p0_graph_state_features.parquet")
-    meta = {"stage": "p0_graph_state", "status": "complete" if len(output) else "empty", "output_rows": len(output), "elapsed_sec": round(time.time() - started, 3)}
+
+    def frames():
+        for _, edges in _edge_snapshots(part, max_row_groups):
+            if edges.empty:
+                continue
+            nodes = np.unique(np.concatenate([edges["src_id"].to_numpy(), edges["dst_id"].to_numpy()]))
+            row = {
+                "decision_time": edges["decision_time"].iloc[0],
+                "layer_id": edges["layer_id"].iloc[0],
+                "scale": edges["scale"].iloc[0],
+                "edge_count": len(edges),
+                "active_node_count": len(nodes),
+                "avg_abs_weight": float(edges["abs_weight"].mean()),
+                "sum_abs_weight": float(edges["abs_weight"].sum()),
+                "max_abs_weight": float(edges["abs_weight"].max()),
+                "density_proxy": len(edges) / max(len(nodes), 1),
+                "pit_audit_pass": True,
+            }
+            yield pd.DataFrame([row])
+
+    rows, batches = stream_frames(output_path, frames())
+    meta = {
+        "stage": "p0_graph_state",
+        "status": "complete" if rows else "empty",
+        "output_rows": rows,
+        "write_batches": batches,
+        "input_mode": "complete_decision_time_stream",
+        "elapsed_sec": round(time.time() - started, 3),
+    }
     write_manifest(output_dir, meta)
     return meta
-
-
-def re_full_intraday_target(column: str) -> bool:
-    return bool(re.fullmatch(r"(?:label_|target_)\d+m", column))
-
-
-def evaluate_p0_one(path: Path) -> list[dict]:
-    rows = []
-    frame = pd.read_parquet(path)
-    if "pit_audit_pass" in frame and not frame.pit_audit_pass.all():
-        raise AssertionError(f"failed PIT rows in {path}")
-    date = ext(path, "date") or "unknown"
-    kind = "edge" if "edge_spillover" in path.name else "node"
-    targets = [column for column in frame if (column.startswith("label_") or column.startswith("target_")) and re_full_intraday_target(column)]
-    features = [column for column in frame if column.startswith("p0_") and pd.api.types.is_numeric_dtype(frame[column])]
-    for keys, subset in frame.groupby(["decision_time", "layer_id", "scale"], dropna=False, sort=False):
-        for feature in features:
-            for target in targets:
-                values = subset[[feature, target]].replace([np.inf, -np.inf], np.nan).dropna()
-                if len(values) < 30:
-                    continue
-                q80, q20 = values[feature].quantile(0.8), values[feature].quantile(0.2)
-                rank_ic = np.nan if values[feature].nunique() < 2 or values[target].nunique() < 2 else values[feature].rank().corr(values[target].rank())
-                rows.append({"date": date, "decision_time": keys[0], "kind": kind, "layer_id": keys[1], "scale": keys[2], "feature": feature, "target": target, "sample_count": len(values), "rank_ic": rank_ic, "top_minus_bottom": values.loc[values[feature] >= q80, target].mean() - values.loc[values[feature] <= q20, target].mean()})
-    return rows
 
 
 def evaluate_p0(root: str | Path, output_dir: str | Path, workers: int = 12, month: str | None = None) -> dict:
-    files = list(Path(root).rglob("p0_node_features.parquet")) + list(Path(root).rglob("p0_edge_spillover_features.parquet"))
-    if month:
-        files = [path for path in files if f"date={month}" in str(path)]
-    list_of_rows = pool(files, workers, evaluate_p0_one)
-    rows = [row for sublist in list_of_rows for row in sublist]
-    metrics = pd.DataFrame(rows)
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    metrics.to_csv(output_dir / "p0_alpha_metrics.csv", index=False)
-    summary = metrics.groupby(["kind", "feature", "target", "layer_id", "scale"], sort=False).agg(days=("date", "nunique"), snapshots=("decision_time", "nunique"), sample_count=("sample_count", "sum"), mean_rank_ic=("rank_ic", "mean"), mean_spread=("top_minus_bottom", "mean"), positive_period_rate=("top_minus_bottom", lambda values: float((values > 0).mean()))).reset_index() if not metrics.empty else pd.DataFrame()
-    summary.to_csv(output_dir / "p0_alpha_summary.csv", index=False)
-    meta = {"stage": "p0_alpha_eval", "status": "complete" if len(metrics) else "empty", "input_files": len(files), "metric_rows": len(metrics), "summary_rows": len(summary), "output_rows": len(metrics), "evaluation_scope": "per_decision_time_cross_section"}
-    write_manifest(output_dir, meta)
-    return meta
+    return evaluate_p0_streaming(root, output_dir, workers, month)
 
 
 def pool(parts, workers, function, *args):
     if not parts:
         return []
     worker_count = max(1, min(int(workers), len(parts)))
-    return collect_process_map(parts, worker_count, function, *args, max_in_flight=worker_count * 2, max_tasks_per_child=1)
+    return collect_process_map(
+        parts,
+        worker_count,
+        function,
+        *args,
+        max_in_flight=worker_count * 2,
+        max_tasks_per_child=1,
+    )
 
 
 def main() -> None:
@@ -265,16 +365,21 @@ def main() -> None:
         sub.add_argument("--max-row-groups", type=int)
         sub.add_argument("--skip-existing", action="store_true")
     p0_eval = commands.add_parser("eval-p0")
-    p0_eval.add_argument("--p0-alpha-root", type=str, required=True)
-    p0_eval.add_argument("--out-dir", type=str, required=True)
+    p0_eval.add_argument("--p0-alpha-root", required=True)
+    p0_eval.add_argument("--out-dir", required=True)
     p0_eval.add_argument("--workers", type=int, default=12)
-    p0_eval.add_argument("--month", type=str, default=None, help="Filter files by month (YYYY-MM)")
+    p0_eval.add_argument("--month")
     args = parser.parse_args()
+
     if args.command == "eval-p0":
         result = evaluate_p0(args.p0_alpha_root, args.out_dir, args.workers, args.month)
     else:
         dates, layers, scales = csvset(args.dates), csvset(args.layers), csvset(args.scales)
-        horizons = [horizon for horizon in (csvlist(args.horizons) or DEFAULT_INTRADAY_HORIZONS) if horizon.endswith("m")]
+        horizons = [
+            horizon
+            for horizon in (csvlist(args.horizons) or DEFAULT_INTRADAY_HORIZONS)
+            if horizon.endswith("m")
+        ]
         parts = discover(args.p0_root, dates, layers, scales)
         if args.command == "node-features":
             result = pool(parts, args.workers, node_features_one, args.labels_root, args.out_root, horizons, args.max_row_groups, args.skip_existing)
