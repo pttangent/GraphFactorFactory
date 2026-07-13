@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 from collections.abc import Iterable
 from pathlib import Path
 
@@ -18,6 +19,25 @@ def _target_rows(value: int | None) -> int:
         return max(1, int(os.environ.get("GFF_PARQUET_TARGET_ROWS", "100000")))
     except (TypeError, ValueError):
         return 100_000
+
+
+def _minimum_free_gb() -> float:
+    try:
+        return max(0.0, float(os.environ.get("GFF_MIN_FREE_GB", "0")))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _check_disk_fuse(path: Path, minimum_free_gb: float) -> None:
+    if minimum_free_gb <= 0:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    free_gb = shutil.disk_usage(path.parent).free / (1024**3)
+    if free_gb < minimum_free_gb:
+        raise OSError(
+            f"streamed parquet disk fuse: {free_gb:.2f}GB free < "
+            f"{minimum_free_gb:.2f}GB required for {path}"
+        )
 
 
 def stream_frames(
@@ -37,6 +57,8 @@ def stream_frames(
     temporary = Path(str(output) + ".tmp")
     temporary.unlink(missing_ok=True)
     target = _target_rows(target_rows)
+    minimum_free_gb = _minimum_free_gb()
+    _check_disk_fuse(output, minimum_free_gb)
 
     writer: pq.ParquetWriter | None = None
     schema: pa.Schema | None = None
@@ -60,6 +82,7 @@ def stream_frames(
         nonlocal buffered, buffered_rows, rows, writes
         if not buffered:
             return
+        _check_disk_fuse(output, minimum_free_gb)
         table = buffered[0] if len(buffered) == 1 else pa.concat_tables(buffered)
         ensure_writer(table.schema).write_table(table, row_group_size=target)
         rows += table.num_rows
@@ -80,6 +103,7 @@ def stream_frames(
 
             if table.num_rows >= target:
                 flush()
+                _check_disk_fuse(output, minimum_free_gb)
                 ensure_writer(table.schema).write_table(table, row_group_size=target)
                 rows += table.num_rows
                 writes += max(1, (table.num_rows + target - 1) // target)
