@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
-"""Six-month local/NAS runner for the PIT-safe P2 pipeline."""
+"""Six-month local/NAS runner for the PIT-safe P2 pipeline.
+
+Heavy phases are deliberately serialized. Robocopy, label injection and P2
+multiprocessing never overlap, so the workstation has one global process/RAM
+budget instead of several independent pools.
+"""
 from __future__ import annotations
 
 import os
 import shutil
-import subprocess
 import sys
-import threading
 import time
 from pathlib import Path
-from queue import Queue
 
 from daily_label_integration import inject_daily_labels
 from p2_alpha_pit_features import DEFAULT_HORIZONS
+from p2_parallel_runtime import run_process_tree
 
 NAS_P0_ROOT = Path(r"P:\US-Stock\GFF_Full_Workspace\graph_store_6m\canonical")
 NAS_P1_ROOT = Path(r"P:\US-Stock\GFF_Full_Workspace\p1_b50_b35_sharded")
@@ -24,44 +27,62 @@ NAS_P2_OUT = Path(r"P:\US-Stock\GFF_Full_Workspace\p2_alpha_full_run")
 MAPPING_PATH = Path(r"D:\DEV\US-Stock\GraphFactorFactory\artifacts\global_symbol_mapping.parquet")
 DAILY_LABELS_PATH = Path(r"D:\DEV\US-Stock\RAW_DATA\1d\daily_labels_2026.parquet")
 MONTHS = ["2026-01", "2026-02", "2026-03", "2026-04", "2026-05", "2026-06"]
+CORES = 24
+RAM_GB = 128
+RESERVE_RAM_GB = 24
+LABEL_WORKERS = 8
+
+
+def run(command: list[str]) -> None:
+    environment = os.environ.copy()
+    environment.setdefault("GFF_MAX_TASKS_PER_CHILD", "1")
+    return_code = run_process_tree(command, env=environment)
+    if return_code != 0:
+        raise RuntimeError(f"command failed with code {return_code}: {' '.join(command)}")
 
 
 def robocopy_dir(source: Path, destination: Path) -> None:
     if not source.exists():
         return
     destination.parent.mkdir(parents=True, exist_ok=True)
-    result = subprocess.run(["robocopy", str(source), str(destination), "/E", "/MT:16", "/R:3", "/W:1", "/NFL", "/NDL", "/NJH", "/NJS", "/A-:R"], capture_output=True)
-    if result.returncode >= 8:
-        raise RuntimeError(f"robocopy failed for {source}: {result.stderr.decode(errors='ignore')}")
+    command = ["robocopy", str(source), str(destination), "/E", "/MT:16", "/R:3", "/W:1", "/NFL", "/NDL", "/NJH", "/NJS", "/A-:R"]
+    return_code = run_process_tree(command, env=os.environ.copy())
+    if return_code >= 8:
+        raise RuntimeError(f"robocopy failed for {source} with code {return_code}")
 
 
-def pull_month(month: str) -> None:
-    print(f"[{time.strftime('%H:%M:%S')}] prefetching {month}")
+def prefetch_month(month: str) -> None:
+    print(f"[{time.strftime('%H:%M:%S')}] prefetching {month}", flush=True)
     LOCAL_P0.mkdir(parents=True, exist_ok=True)
     LOCAL_P1.mkdir(parents=True, exist_ok=True)
     for source in NAS_P0_ROOT.glob(f"date={month}-*"):
         robocopy_dir(source, LOCAL_P0 / source.name)
     for source in NAS_P1_ROOT.glob(f"date={month}-*"):
         robocopy_dir(source, LOCAL_P1 / source.name)
+
+
+def inject_month_labels(month: str) -> None:
     if not MAPPING_PATH.exists() or not DAILY_LABELS_PATH.exists():
         raise FileNotFoundError("stable mapping or PIT-safe daily labels missing")
-    report = inject_daily_labels(LOCAL_P0, DAILY_LABELS_PATH, MAPPING_PATH, month)
+    print(f"[{time.strftime('%H:%M:%S')}] injecting daily labels for {month}", flush=True)
+    report = inject_daily_labels(
+        LOCAL_P0,
+        DAILY_LABELS_PATH,
+        MAPPING_PATH,
+        month,
+        workers=LABEL_WORKERS,
+    )
     if report["updated_files"] == 0:
         raise RuntimeError(f"no daily labels injected for {month}")
-    print(f"[{time.strftime('%H:%M:%S')}] injected next-open labels: {report}")
-
-
-def run(command: list[str]) -> None:
-    result = subprocess.run(command, env=os.environ.copy())
-    if result.returncode != 0:
-        print(f"ERROR: command failed with code {result.returncode}: {' '.join(command)}", flush=True)
-        os._exit(result.returncode)
+    print(f"[{time.strftime('%H:%M:%S')}] injected next-open labels: {report}", flush=True)
 
 
 def run_p2_month(month: str) -> None:
     dates = sorted(path.name.split("=", 1)[1] for path in LOCAL_P0.glob(f"date={month}-*"))
     if not dates:
-        return
+        raise RuntimeError(f"no local P0 dates found for {month}")
+
+    inject_month_labels(month)
     run([
         sys.executable,
         "scripts/run_p2_24core_scheduler.py",
@@ -73,15 +94,21 @@ def run_p2_month(month: str) -> None:
         "--layers", "3,6,8,9,11",
         "--scales", "15m,30m",
         "--horizons", ",".join(DEFAULT_HORIZONS),
-        "--profile", "max",
-        "--cores", "28",
+        "--profile", "balanced",
+        "--cores", str(CORES),
+        "--ram-gb", str(RAM_GB),
+        "--reserve-ram-gb", str(RESERVE_RAM_GB),
         "--target-cpu", "1.0",
-        "--inner-workers", "1",
+        "--inner-workers", "0",
         "--skip-existing",
     ])
+
     month_str = month.replace("-", "")
     run([sys.executable, "scripts/p2_alpha_daily_features.py", "evaluate-intraday", "--features-root", str(LOCAL_P2_OUT / "intraday_relation_features"), "--out-dir", str(LOCAL_P2_OUT / f"intraday_relation_eval/{month_str}")])
     run([sys.executable, "scripts/p2_alpha_daily_features.py", "evaluate-daily", "--features-root", str(LOCAL_P2_OUT / "daily_relation_features"), "--out-dir", str(LOCAL_P2_OUT / f"daily_relation_eval/{month_str}")])
+
+
+def cleanup_month(month: str) -> None:
     for directory in LOCAL_P0.glob(f"date={month}-*"):
         shutil.rmtree(directory, ignore_errors=True)
     for directory in LOCAL_P1.glob(f"date={month}-*"):
@@ -89,28 +116,12 @@ def run_p2_month(month: str) -> None:
 
 
 def main() -> None:
-    queue: Queue[str | None] = Queue(maxsize=1)
-
-    def producer() -> None:
-        for month in MONTHS:
-            pull_month(month)
-            queue.put(month)
-        queue.put(None)
-
-    def consumer() -> None:
-        while True:
-            month = queue.get()
-            if month is None:
-                return
-            run_p2_month(month)
-            queue.task_done()
-
-    producer_thread = threading.Thread(target=producer)
-    consumer_thread = threading.Thread(target=consumer)
-    producer_thread.start()
-    consumer_thread.start()
-    producer_thread.join()
-    consumer_thread.join()
+    for month in MONTHS:
+        prefetch_month(month)
+        run_p2_month(month)
+        # Keep local inputs when a stage raises so the failed month can resume
+        # without another NAS download. Cleanup happens only after success.
+        cleanup_month(month)
     run([sys.executable, "scripts/p2_alpha_daily_features.py", "evaluate-intraday", "--features-root", str(LOCAL_P2_OUT / "intraday_relation_features"), "--out-dir", str(LOCAL_P2_OUT / "intraday_relation_eval_global")])
     run([sys.executable, "scripts/p2_alpha_daily_features.py", "evaluate-daily", "--features-root", str(LOCAL_P2_OUT / "daily_relation_features"), "--out-dir", str(LOCAL_P2_OUT / "daily_relation_eval_global")])
 
