@@ -22,6 +22,7 @@ SUM_COLUMNS = [
     "negative_source_count",
     "relation_edge_count",
 ]
+_INTERNAL_STATE_COLUMNS = {"relation_strength_sum", "relation_strength_count"}
 
 
 def _episode_lookup(temporal_edges: pd.DataFrame | None) -> dict[str, str]:
@@ -101,7 +102,7 @@ def _state_frame(state: dict, session_close: pd.Timestamp) -> pd.DataFrame:
     rows: list[dict] = []
     for key, values in state.items():
         row = dict(zip(GROUP_COLUMNS, key))
-        row.update(values)
+        row.update({name: value for name, value in values.items() if name not in _INTERNAL_STATE_COLUMNS})
         count = int(values["relation_strength_count"])
         row["relation_strength_mean"] = values["relation_strength_sum"] / count if count else np.nan
         row["session_close"] = session_close
@@ -203,6 +204,7 @@ def build_daily_feature_frame_streaming(
     recent: deque[tuple[pd.Timestamp, pd.DataFrame]] = deque()
     final_snapshot = pd.DataFrame()
     session_close: pd.Timestamp | None = None
+    partition_identity: tuple[str, str, str] | None = None
     late_delta = pd.Timedelta(minutes=late_minutes)
 
     for decision_time, raw in iter_time_groups(source_path, None, max_row_groups):
@@ -210,7 +212,20 @@ def build_daily_feature_frame_streaming(
         if snapshot.empty:
             continue
         if snapshot["date"].nunique(dropna=False) != 1 or snapshot["layer_id"].nunique(dropna=False) != 1 or snapshot["scale"].nunique(dropna=False) != 1:
-            raise ValueError(f"daily streaming partition mixes date/layer/scale: {source_path}")
+            raise ValueError(f"daily streaming snapshot mixes date/layer/scale: {source_path}")
+        current_identity = (
+            str(snapshot["date"].iloc[0]),
+            str(snapshot["layer_id"].iloc[0]),
+            str(snapshot["scale"].iloc[0]),
+        )
+        if partition_identity is None:
+            partition_identity = current_identity
+        elif current_identity != partition_identity:
+            raise ValueError(
+                f"daily streaming file crosses physical date/layer/scale partitions: "
+                f"expected={partition_identity}, found={current_identity}, path={source_path}"
+            )
+
         _update_state(state, _snapshot_aggregate(snapshot))
         recent.append((decision_time, _late_aggregate(snapshot)))
         while recent and recent[0][0] < decision_time - late_delta:
