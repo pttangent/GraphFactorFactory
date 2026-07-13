@@ -1,0 +1,1 @@
+Validate the current v5-daily-labels-integration resource and PIT architecture on Windows and Linux.
