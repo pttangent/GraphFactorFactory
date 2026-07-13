@@ -1,0 +1,1 @@
+Validate latest branch including explicit Parquet close and scheduler-controlled downstream worker reuse.
