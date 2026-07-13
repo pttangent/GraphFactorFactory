@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""Six-month local/NAS runner for the PIT-safe P2 pipeline.
+"""Six-month local/NAS runner for the PIT-safe P0/P2 pipeline.
 
-Heavy phases are deliberately serialized. Robocopy, label injection and P2
-multiprocessing never overlap, so the workstation has one global process/RAM
-budget instead of several independent pools.
+Copy, daily-label injection, compute, evaluation and cleanup are strictly
+serialized. Monthly evaluation is performed exactly once by the scheduler.
 """
 from __future__ import annotations
 
@@ -65,13 +64,7 @@ def inject_month_labels(month: str) -> None:
     if not MAPPING_PATH.exists() or not DAILY_LABELS_PATH.exists():
         raise FileNotFoundError("stable mapping or PIT-safe daily labels missing")
     print(f"[{time.strftime('%H:%M:%S')}] injecting daily labels for {month}", flush=True)
-    report = inject_daily_labels(
-        LOCAL_P0,
-        DAILY_LABELS_PATH,
-        MAPPING_PATH,
-        month,
-        workers=LABEL_WORKERS,
-    )
+    report = inject_daily_labels(LOCAL_P0, DAILY_LABELS_PATH, MAPPING_PATH, month, workers=LABEL_WORKERS)
     if report["updated_files"] == 0:
         raise RuntimeError(f"no daily labels injected for {month}")
     print(f"[{time.strftime('%H:%M:%S')}] injected next-open labels: {report}", flush=True)
@@ -81,7 +74,6 @@ def run_p2_month(month: str) -> None:
     dates = sorted(path.name.split("=", 1)[1] for path in LOCAL_P0.glob(f"date={month}-*"))
     if not dates:
         raise RuntimeError(f"no local P0 dates found for {month}")
-
     inject_month_labels(month)
     run([
         sys.executable,
@@ -103,10 +95,6 @@ def run_p2_month(month: str) -> None:
         "--skip-existing",
     ])
 
-    month_str = month.replace("-", "")
-    run([sys.executable, "scripts/p2_alpha_daily_features.py", "evaluate-intraday", "--features-root", str(LOCAL_P2_OUT / "intraday_relation_features"), "--out-dir", str(LOCAL_P2_OUT / f"intraday_relation_eval/{month_str}")])
-    run([sys.executable, "scripts/p2_alpha_daily_features.py", "evaluate-daily", "--features-root", str(LOCAL_P2_OUT / "daily_relation_features"), "--out-dir", str(LOCAL_P2_OUT / f"daily_relation_eval/{month_str}")])
-
 
 def cleanup_month(month: str) -> None:
     for directory in LOCAL_P0.glob(f"date={month}-*"):
@@ -115,15 +103,18 @@ def cleanup_month(month: str) -> None:
         shutil.rmtree(directory, ignore_errors=True)
 
 
+def run_global_evaluation() -> None:
+    eval_workers = 12
+    run([sys.executable, "scripts/p2_alpha_daily_features.py", "evaluate-intraday", "--features-root", str(LOCAL_P2_OUT / "intraday_relation_features"), "--out-dir", str(LOCAL_P2_OUT / "intraday_relation_eval/global"), "--workers", str(eval_workers)])
+    run([sys.executable, "scripts/p2_alpha_daily_features.py", "evaluate-daily", "--features-root", str(LOCAL_P2_OUT / "daily_relation_features"), "--out-dir", str(LOCAL_P2_OUT / "daily_relation_eval/global"), "--workers", str(eval_workers)])
+
+
 def main() -> None:
     for month in MONTHS:
         prefetch_month(month)
         run_p2_month(month)
-        # Keep local inputs when a stage raises so the failed month can resume
-        # without another NAS download. Cleanup happens only after success.
         cleanup_month(month)
-    run([sys.executable, "scripts/p2_alpha_daily_features.py", "evaluate-intraday", "--features-root", str(LOCAL_P2_OUT / "intraday_relation_features"), "--out-dir", str(LOCAL_P2_OUT / "intraday_relation_eval_global")])
-    run([sys.executable, "scripts/p2_alpha_daily_features.py", "evaluate-daily", "--features-root", str(LOCAL_P2_OUT / "daily_relation_features"), "--out-dir", str(LOCAL_P2_OUT / "daily_relation_eval_global")])
+    run_global_evaluation()
 
 
 if __name__ == "__main__":
