@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 
 from p2_parallel_runtime import collect_process_map
@@ -13,7 +14,7 @@ from p2_pit_theme import *
 from p2_pit_theme_streaming import build_theme_returns_one, relation_spillover_one
 from p2_pit_features import *
 from p2_pit_runner_streaming import build_feature_one
-from p2_eval_streaming import evaluate_feature_root
+from p2_eval_streaming import evaluate_feature_root, merge_evaluation_states
 
 
 def pool(parts: list[Part], workers: int, function, *args) -> list[dict]:
@@ -26,17 +27,20 @@ def pool(parts: list[Part], workers: int, function, *args) -> list[dict]:
         function,
         *args,
         max_in_flight=worker_count * 2,
-        max_tasks_per_child=1,
+        max_tasks_per_child=None,
     )
 
 
 def save_run_summary(root: str | Path, results: list[dict]) -> None:
     root = Path(root)
     root.mkdir(parents=True, exist_ok=True)
-    (root / "run_summary.json").write_text(
+    destination = root / "run_summary.json"
+    temporary = root / "run_summary.json.tmp"
+    temporary.write_text(
         json.dumps({"pit_contract_version": PIT_CONTRACT_VERSION, "results": results}, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
+    os.replace(temporary, destination)
 
 
 def main() -> None:
@@ -85,6 +89,13 @@ def main() -> None:
         evaluation.add_argument("--dates")
         evaluation.add_argument("--layers")
         evaluation.add_argument("--scales")
+        evaluation.add_argument("--csv-mode", choices=["none", "sharded", "single"], default="none")
+        evaluation.add_argument("--skip-existing", action="store_true")
+
+    for command in ("merge-intraday-eval", "merge-daily-eval"):
+        merge_parser = subparsers.add_parser(command)
+        merge_parser.add_argument("--evaluation-root", required=True)
+        merge_parser.add_argument("--out-dir", required=True)
 
     args = parser.parse_args()
     dates = csvset(getattr(args, "dates", None))
@@ -109,9 +120,13 @@ def main() -> None:
         results = pool(parts, args.workers, build_feature_one, args.out_root, mode, args.underreaction_past_horizon, args.late_minutes, args.skip_existing, args.max_row_groups, args.p1_root)
         save_run_summary(args.out_root, results)
     elif args.command == "evaluate-intraday":
-        results = evaluate_feature_root(args.features_root, args.out_dir, "intraday", args.workers, dates, layers, scales)
+        results = evaluate_feature_root(args.features_root, args.out_dir, "intraday", args.workers, dates, layers, scales, args.csv_mode, args.skip_existing)
+    elif args.command == "evaluate-daily":
+        results = evaluate_feature_root(args.features_root, args.out_dir, "daily", args.workers, dates, layers, scales, args.csv_mode, args.skip_existing)
+    elif args.command == "merge-intraday-eval":
+        results = merge_evaluation_states(args.evaluation_root, args.out_dir, "intraday")
     else:
-        results = evaluate_feature_root(args.features_root, args.out_dir, "daily", args.workers, dates, layers, scales)
+        results = merge_evaluation_states(args.evaluation_root, args.out_dir, "daily")
     print(json.dumps({"command": args.command, "result": results}, indent=2, ensure_ascii=False, default=str))
 
 
