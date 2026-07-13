@@ -79,9 +79,11 @@ def read_row_group(parquet: pq.ParquetFile, index: int) -> pd.DataFrame:
     return parquet.read_row_group(index, columns=columns).to_pandas()
 
 
-def node_features_one(part: Part, labels_root: str, output_root: str, horizons: list[str], max_row_groups: int | None) -> dict:
+def node_features_one(part: Part, labels_root: str, output_root: str, horizons: list[str], max_row_groups: int | None, skip_existing: bool = False) -> dict:
     started = time.time()
     output_dir = Path(output_root) / f"date={part.date}" / f"layer_id={part.layer_id}" / f"scale={part.scale}"
+    if skip_existing and output_dir.exists():
+        return {"date": part.date, "layer": part.layer_id, "scale": part.scale, "status": "skipped", "duration": 0}
     labels = load_labels(label_path(labels_root, part.date), horizons)
     labels_by_time = {key: value for key, value in labels.groupby("decision_time", sort=False)}
     parquet = pq.ParquetFile(part.base)
@@ -111,9 +113,11 @@ def node_features_one(part: Part, labels_root: str, output_root: str, horizons: 
     return meta
 
 
-def edge_spillover_one(part: Part, labels_root: str, output_root: str, horizons: list[str], past_horizon: str, max_row_groups: int | None) -> dict:
+def edge_spillover_one(part: Part, labels_root: str, output_root: str, horizons: list[str], past_horizon: str, max_row_groups: int | None, skip_existing: bool = False) -> dict:
     started = time.time()
     output_dir = Path(output_root) / f"date={part.date}" / f"layer_id={part.layer_id}" / f"scale={part.scale}"
+    if skip_existing and output_dir.exists():
+        return {"date": part.date, "layer": part.layer_id, "scale": part.scale, "status": "skipped", "duration": 0}
     labels = load_labels(label_path(labels_root, part.date), horizons)
     past = f"past_label_{past_horizon}"
     if past not in labels:
@@ -164,8 +168,11 @@ def edge_spillover_one(part: Part, labels_root: str, output_root: str, horizons:
     return meta
 
 
-def graph_state_one(part: Part, output_root: str, max_row_groups: int | None) -> dict:
+def graph_state_one(part: Part, output_root: str, max_row_groups: int | None, skip_existing: bool = False) -> dict:
+    started = time.time()
     output_dir = Path(output_root) / f"date={part.date}" / f"layer_id={part.layer_id}" / f"scale={part.scale}"
+    if skip_existing and output_dir.exists():
+        return {"date": part.date, "layer": part.layer_id, "scale": part.scale, "status": "skipped", "duration": 0}
     parquet = pq.ParquetFile(part.base)
     count = parquet.metadata.num_row_groups if max_row_groups is None else min(max_row_groups, parquet.metadata.num_row_groups)
     rows = []
@@ -187,26 +194,33 @@ def re_full_intraday_target(column: str) -> bool:
     return bool(re.fullmatch(r"(?:label_|target_)\d+m", column))
 
 
-def evaluate_p0(root: str | Path, output_dir: str | Path) -> dict:
+def evaluate_p0_one(path: Path) -> list[dict]:
     rows = []
+    frame = pd.read_parquet(path)
+    if "pit_audit_pass" in frame and not frame.pit_audit_pass.all():
+        raise AssertionError(f"failed PIT rows in {path}")
+    date = ext(path, "date") or "unknown"
+    kind = "edge" if "edge_spillover" in path.name else "node"
+    targets = [column for column in frame if (column.startswith("label_") or column.startswith("target_")) and re_full_intraday_target(column)]
+    features = [column for column in frame if column.startswith("p0_") and pd.api.types.is_numeric_dtype(frame[column])]
+    for keys, subset in frame.groupby(["decision_time", "layer_id", "scale"], dropna=False, sort=False):
+        for feature in features:
+            for target in targets:
+                values = subset[[feature, target]].replace([np.inf, -np.inf], np.nan).dropna()
+                if len(values) < 30:
+                    continue
+                q80, q20 = values[feature].quantile(0.8), values[feature].quantile(0.2)
+                rank_ic = np.nan if values[feature].nunique() < 2 or values[target].nunique() < 2 else values[feature].rank().corr(values[target].rank())
+                rows.append({"date": date, "decision_time": keys[0], "kind": kind, "layer_id": keys[1], "scale": keys[2], "feature": feature, "target": target, "sample_count": len(values), "rank_ic": rank_ic, "top_minus_bottom": values.loc[values[feature] >= q80, target].mean() - values.loc[values[feature] <= q20, target].mean()})
+    return rows
+
+
+def evaluate_p0(root: str | Path, output_dir: str | Path, workers: int = 12) -> dict:
     files = list(Path(root).rglob("p0_node_features.parquet")) + list(Path(root).rglob("p0_edge_spillover_features.parquet"))
-    for path in files:
-        frame = pd.read_parquet(path)
-        if "pit_audit_pass" in frame and not frame.pit_audit_pass.all():
-            raise AssertionError(f"failed PIT rows in {path}")
-        date = ext(path, "date") or "unknown"
-        kind = "edge" if "edge_spillover" in path.name else "node"
-        targets = [column for column in frame if (column.startswith("label_") or column.startswith("target_")) and re_full_intraday_target(column)]
-        features = [column for column in frame if column.startswith("p0_") and pd.api.types.is_numeric_dtype(frame[column])]
-        for keys, subset in frame.groupby(["decision_time", "layer_id", "scale"], dropna=False, sort=False):
-            for feature in features:
-                for target in targets:
-                    values = subset[[feature, target]].replace([np.inf, -np.inf], np.nan).dropna()
-                    if len(values) < 30:
-                        continue
-                    q80, q20 = values[feature].quantile(0.8), values[feature].quantile(0.2)
-                    rank_ic = np.nan if values[feature].nunique() < 2 or values[target].nunique() < 2 else values[feature].rank().corr(values[target].rank())
-                    rows.append({"date": date, "decision_time": keys[0], "kind": kind, "layer_id": keys[1], "scale": keys[2], "feature": feature, "target": target, "sample_count": len(values), "rank_ic": rank_ic, "top_minus_bottom": values.loc[values[feature] >= q80, target].mean() - values.loc[values[feature] <= q20, target].mean()})
+    
+    list_of_rows = pool(files, workers, evaluate_p0_one)
+    rows = [row for sublist in list_of_rows for row in sublist]
+    
     metrics = pd.DataFrame(rows)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -244,19 +258,20 @@ def main() -> None:
     evaluate = commands.add_parser("eval-p0")
     evaluate.add_argument("--p0-alpha-root", required=True)
     evaluate.add_argument("--out-dir", required=True)
+    evaluate.add_argument("--workers", type=int, default=12)
     args = parser.parse_args()
     if args.command == "eval-p0":
-        result = evaluate_p0(args.p0_alpha_root, args.out_dir)
+        result = evaluate_p0(args.p0_alpha_root, args.out_dir, args.workers)
     else:
         dates, layers, scales = csvset(args.dates), csvset(args.layers), csvset(args.scales)
         horizons = [h for h in (csvlist(args.horizons) or DEFAULT_INTRADAY_HORIZONS) if h.endswith("m")]
         parts = discover(args.p0_root, dates, layers, scales)
         if args.command == "node-features":
-            result = pool(parts, args.workers, node_features_one, args.labels_root, args.out_root, horizons, args.max_row_groups)
+            result = pool(parts, args.workers, node_features_one, args.labels_root, args.out_root, horizons, args.max_row_groups, args.skip_existing)
         elif args.command == "edge-spillover":
-            result = pool(parts, args.workers, edge_spillover_one, args.labels_root, args.out_root, horizons, args.past_horizon, args.max_row_groups)
+            result = pool(parts, args.workers, edge_spillover_one, args.labels_root, args.out_root, horizons, args.past_horizon, args.max_row_groups, args.skip_existing)
         else:
-            result = pool(parts, args.workers, graph_state_one, args.out_root, args.max_row_groups)
+            result = pool(parts, args.workers, graph_state_one, args.out_root, args.max_row_groups, args.skip_existing)
     print(json.dumps({"pit_contract_version": PIT_CONTRACT_VERSION, "result": result}, indent=2, ensure_ascii=False, default=str))
 
 

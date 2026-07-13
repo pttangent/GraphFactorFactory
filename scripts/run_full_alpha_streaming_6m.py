@@ -30,7 +30,7 @@ def robocopy_dir(source: Path, destination: Path) -> None:
     if not source.exists():
         return
     destination.parent.mkdir(parents=True, exist_ok=True)
-    result = subprocess.run(["robocopy", str(source), str(destination), "/E", "/MT:16", "/R:3", "/W:1", "/NFL", "/NDL", "/NJH", "/NJS"], capture_output=True)
+    result = subprocess.run(["robocopy", str(source), str(destination), "/E", "/MT:16", "/R:3", "/W:1", "/NFL", "/NDL", "/NJH", "/NJS", "/A-:R"], capture_output=True)
     if result.returncode >= 8:
         raise RuntimeError(f"robocopy failed for {source}: {result.stderr.decode(errors='ignore')}")
 
@@ -54,7 +54,8 @@ def pull_month(month: str) -> None:
 def run(command: list[str]) -> None:
     result = subprocess.run(command, env=os.environ.copy())
     if result.returncode != 0:
-        raise SystemExit(result.returncode)
+        print(f"ERROR: command failed with code {result.returncode}: {' '.join(command)}", flush=True)
+        os._exit(result.returncode)
 
 
 def run_p2_month(month: str) -> None:
@@ -73,7 +74,7 @@ def run_p2_month(month: str) -> None:
         "--scales", "15m,30m",
         "--horizons", ",".join(DEFAULT_HORIZONS),
         "--profile", "max",
-        "--cores", "24",
+        "--cores", "12",
         "--target-cpu", "1.0",
         "--inner-workers", "1",
         "--skip-existing",

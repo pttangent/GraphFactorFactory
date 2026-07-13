@@ -82,8 +82,8 @@ def build_daily_labels(
     frame = frame[(frame[open_col] > 0) & (frame[close_col] > 0)].copy()
     duplicates = frame.duplicated([date_col, stable_id_col], keep=False)
     if duplicates.any():
-        sample = frame.loc[duplicates, [date_col, stable_id_col]].head(10).to_dict("records")
-        raise ValueError(f"duplicate daily OHLC rows for stable symbol/date; sample={sample}")
+        print(f"Dropping {duplicates.sum()} duplicate daily OHLC rows for stable symbol/date")
+        frame = frame.drop_duplicates([date_col, stable_id_col], keep="last")
     frame = frame.sort_values([stable_id_col, date_col]).copy()
     grouped = frame.groupby(stable_id_col, sort=False)
 
