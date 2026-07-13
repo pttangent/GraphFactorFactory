@@ -215,8 +215,10 @@ def evaluate_p0_one(path: Path) -> list[dict]:
     return rows
 
 
-def evaluate_p0(root: str | Path, output_dir: str | Path, workers: int = 12) -> dict:
+def evaluate_p0(root: str | Path, output_dir: str | Path, workers: int = 12, month: str = None) -> dict:
     files = list(Path(root).rglob("p0_node_features.parquet")) + list(Path(root).rglob("p0_edge_spillover_features.parquet"))
+    if month:
+        files = [f for f in files if f"date={month}" in str(f)]
     
     list_of_rows = pool(files, workers, evaluate_p0_one)
     rows = [row for sublist in list_of_rows for row in sublist]
@@ -255,13 +257,14 @@ def main() -> None:
         sub.add_argument("--workers", type=int, default=16)
         sub.add_argument("--max-row-groups", type=int)
         sub.add_argument("--skip-existing", action="store_true")
-    evaluate = commands.add_parser("eval-p0")
-    evaluate.add_argument("--p0-alpha-root", required=True)
-    evaluate.add_argument("--out-dir", required=True)
-    evaluate.add_argument("--workers", type=int, default=12)
+    p0_eval = commands.add_parser("eval-p0")
+    p0_eval.add_argument("--p0-alpha-root", type=str, required=True)
+    p0_eval.add_argument("--out-dir", type=str, required=True)
+    p0_eval.add_argument("--workers", type=int, default=12)
+    p0_eval.add_argument("--month", type=str, default=None, help="Filter files by month (YYYY-MM)")
     args = parser.parse_args()
     if args.command == "eval-p0":
-        result = evaluate_p0(args.p0_alpha_root, args.out_dir, args.workers)
+        result = evaluate_p0(args.p0_alpha_root, args.out_dir, args.workers, args.month)
     else:
         dates, layers, scales = csvset(args.dates), csvset(args.layers), csvset(args.scales)
         horizons = [h for h in (csvlist(args.horizons) or DEFAULT_INTRADAY_HORIZONS) if h.endswith("m")]

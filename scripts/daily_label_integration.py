@@ -5,9 +5,25 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import concurrent.futures
 from pathlib import Path
 
 import pandas as pd
+
+
+def _process_label_file(args: tuple[Path, pd.DataFrame, list[str]]) -> tuple[int, int]:
+    label_path, daily_for_date, injected = args
+    if daily_for_date.empty:
+        return 0, 0
+    intraday = pd.read_parquet(label_path)
+    replace_columns = [column for column in injected if column in intraday]
+    if replace_columns:
+        intraday = intraday.drop(columns=replace_columns)
+    merged = intraday.merge(daily_for_date, on="symbol_id", how="left", validate="many_to_one")
+    temporary = label_path.with_suffix(".parquet.tmp")
+    merged.to_parquet(temporary, index=False)
+    temporary.replace(label_path)
+    return 1, len(merged)
 
 
 def prepare_daily_labels(daily: pd.DataFrame, mapping: pd.DataFrame) -> pd.DataFrame:
@@ -52,21 +68,17 @@ def inject_daily_labels(labels_root: Path, daily_labels_path: Path, mapping_path
     files = sorted(path / "labels.parquet" for path in labels_root.glob(pattern) if (path / "labels.parquet").exists())
     updated = rows = 0
     injected = [c for c in prepared if c.startswith("label_") or c == "daily_label_execution_policy"]
+    
+    tasks = []
     for label_path in files:
         date = label_path.parent.name.split("=", 1)[1]
         daily_for_date = prepared.loc[prepared.date.eq(date)].drop(columns="date")
-        if daily_for_date.empty:
-            continue
-        intraday = pd.read_parquet(label_path)
-        replace_columns = [column for column in injected if column in intraday]
-        if replace_columns:
-            intraday = intraday.drop(columns=replace_columns)
-        merged = intraday.merge(daily_for_date, on="symbol_id", how="left", validate="many_to_one")
-        temporary = label_path.with_suffix(".parquet.tmp")
-        merged.to_parquet(temporary, index=False)
-        temporary.replace(label_path)
-        updated += 1
-        rows += len(merged)
+        tasks.append((label_path, daily_for_date, injected))
+        
+    with concurrent.futures.ProcessPoolExecutor(max_workers=32) as executor:
+        for u, r in executor.map(_process_label_file, tasks):
+            updated += u
+            rows += r
     return {"updated_files": updated, "rows": rows, "execution_policy": "next_session_open", "injected_columns": injected}
 
 

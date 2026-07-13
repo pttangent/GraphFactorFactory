@@ -74,13 +74,14 @@ def run_p2_month(month: str) -> None:
         "--scales", "15m,30m",
         "--horizons", ",".join(DEFAULT_HORIZONS),
         "--profile", "max",
-        "--cores", "12",
+        "--cores", "28",
         "--target-cpu", "1.0",
         "--inner-workers", "1",
         "--skip-existing",
     ])
-    run([sys.executable, "scripts/p2_alpha_daily_features.py", "evaluate-intraday", "--features-root", str(LOCAL_P2_OUT / "intraday_relation_features"), "--out-dir", str(LOCAL_P2_OUT / f"intraday_relation_eval_{month}")])
-    run([sys.executable, "scripts/p2_alpha_daily_features.py", "evaluate-daily", "--features-root", str(LOCAL_P2_OUT / "daily_relation_features"), "--out-dir", str(LOCAL_P2_OUT / f"daily_relation_eval_{month}")])
+    month_str = month.replace("-", "")
+    run([sys.executable, "scripts/p2_alpha_daily_features.py", "evaluate-intraday", "--features-root", str(LOCAL_P2_OUT / "intraday_relation_features"), "--out-dir", str(LOCAL_P2_OUT / f"intraday_relation_eval/{month_str}")])
+    run([sys.executable, "scripts/p2_alpha_daily_features.py", "evaluate-daily", "--features-root", str(LOCAL_P2_OUT / "daily_relation_features"), "--out-dir", str(LOCAL_P2_OUT / f"daily_relation_eval/{month_str}")])
     for directory in LOCAL_P0.glob(f"date={month}-*"):
         shutil.rmtree(directory, ignore_errors=True)
     for directory in LOCAL_P1.glob(f"date={month}-*"):

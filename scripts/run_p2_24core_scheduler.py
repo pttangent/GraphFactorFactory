@@ -174,7 +174,12 @@ def main() -> None:
         stage = plan["p0-graph-state"]
         run_command([python, args.p0_script, "graph-state", "--p0-root", args.p0_root, "--out-root", str(root / "p0_graph_state"), "--workers", str(stage.workers)] + p0_filters(args), environment, args.dry_run)
     if args.stage in {"all", "p0", "p0-eval"}:
-        run_command([python, args.p0_script, "eval-p0", "--p0-alpha-root", str(root), "--out-dir", str(root / "p0_alpha_eval")], environment, args.dry_run)
+        month = args.dates.split(",")[0][:7] if args.dates else "unknown"
+        eval_dir = f"p0_alpha/{month.replace('-', '')}"
+        if args.skip_existing and (root / eval_dir / "p0_alpha_metrics.csv").exists():
+            print(f"Skipping existing P0 eval at {root / eval_dir}", flush=True)
+        else:
+            run_command([python, args.p0_script, "eval-p0", "--p0-alpha-root", str(root), "--out-dir", str(root / eval_dir), "--month", month], environment, args.dry_run)
 
     if args.stage in {"all", "theme"}:
         if not args.p1_root:
