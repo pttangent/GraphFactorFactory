@@ -2,14 +2,22 @@
 """PIT-safe P2 theme return and symmetric relation transforms."""
 from __future__ import annotations
 
-import concurrent.futures as cf
 import time
+from collections.abc import Iterable
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
+from p2_parallel_runtime import bounded_thread_map
 from p2_pit_core import *
+
+
+def _lookup_time(indexed: pd.DataFrame, decision_time: pd.Timestamp) -> pd.DataFrame:
+    try:
+        return indexed.loc[[decision_time]]
+    except KeyError:
+        return pd.DataFrame(columns=indexed.columns)
 
 
 def _aggregate_theme_returns(member_frame: pd.DataFrame, label_frame: pd.DataFrame, horizons: list[str]) -> pd.DataFrame | None:
@@ -20,19 +28,37 @@ def _aggregate_theme_returns(member_frame: pd.DataFrame, label_frame: pd.DataFra
         left_on=["decision_time", "member_id"],
         right_on=["decision_time", "symbol_id"],
         how="inner",
+        copy=False,
     )
     if merged.empty:
         return None
     group_columns = ["decision_time", "layer_id", "scale", "level", "theme_id"]
     merged = merged.sort_values(group_columns + ["core_score"], ascending=[True, True, True, True, True, False])
     grouped = merged.groupby(group_columns, sort=False)
-    result = pd.DataFrame(index=grouped.size().index)
+
+    numeric_labels = [
+        column
+        for column in merged.columns
+        if (column.startswith("label_") or column.startswith("past_label_"))
+        and pd.api.types.is_numeric_dtype(merged[column])
+    ]
+    rename_equal = {
+        column: (
+            column.replace("past_label_", "past_eq_")
+            if column.startswith("past_label_")
+            else column.replace("label_", "ret_eq_")
+        )
+        for column in numeric_labels
+    }
+    if numeric_labels:
+        result = grouped[numeric_labels].mean().rename(columns=rename_equal)
+    else:
+        result = pd.DataFrame(index=grouped.size().index)
 
     for horizon in horizons:
         target = f"label_{horizon}"
         if target not in merged:
             continue
-        result[f"ret_eq_{horizon}"] = grouped[target].mean()
         if is_intraday_horizon(horizon):
             entry = f"label_entry_time_{horizon}" if f"label_entry_time_{horizon}" in merged else "label_entry_time"
             exit_column = f"label_exit_time_{horizon}"
@@ -41,8 +67,7 @@ def _aggregate_theme_returns(member_frame: pd.DataFrame, label_frame: pd.DataFra
             if exit_column in merged:
                 result[f"target_exit_time_{horizon}"] = grouped[exit_column].max()
             past = f"past_label_{horizon}"
-            if past in merged:
-                result[f"past_eq_{horizon}"] = grouped[past].mean()
+            if past in merged and f"past_exit_time_{horizon}" in merged:
                 result[f"past_available_time_{horizon}"] = grouped[f"past_exit_time_{horizon}"].max()
         else:
             for prefix in ("entry", "exit"):
@@ -50,22 +75,30 @@ def _aggregate_theme_returns(member_frame: pd.DataFrame, label_frame: pd.DataFra
                 if source in merged:
                     result[f"target_{prefix}_date_{horizon}"] = grouped[source].max()
 
-    weights = grouped["core_score"].sum().replace(0, np.nan)
-    numeric_labels = [c for c in merged.columns if c.startswith("label_") or c.startswith("past_label_")]
-    for column in numeric_labels:
-        if not pd.api.types.is_numeric_dtype(merged[column]):
-            continue
-        weighted = merged[group_columns].copy()
-        weighted["_weighted_value"] = merged[column] * merged["core_score"]
-        output = column.replace("past_label_", "past_core_") if column.startswith("past_label_") else column.replace("label_", "ret_core_")
-        result[output] = weighted.groupby(group_columns, sort=False)["_weighted_value"].sum() / weights
+    if numeric_labels:
+        weights = grouped["core_score"].sum().replace(0, np.nan)
+        weighted = merged[numeric_labels].multiply(merged["core_score"], axis=0)
+        weighted.index = pd.MultiIndex.from_frame(merged[group_columns], names=group_columns)
+        weighted_sums = weighted.groupby(level=list(range(len(group_columns))), sort=False).sum(min_count=1)
+        core = weighted_sums.div(weights, axis=0)
+        core.columns = [
+            column.replace("past_label_", "past_core_")
+            if column.startswith("past_label_")
+            else column.replace("label_", "ret_core_")
+            for column in core.columns
+        ]
+        result = result.join(core)
+        del weighted, weighted_sums, core
 
-    top5 = grouped.head(5).groupby(group_columns, sort=False)
-    for column in numeric_labels:
-        if not pd.api.types.is_numeric_dtype(merged[column]):
-            continue
-        output = column.replace("past_label_", "past_top5_") if column.startswith("past_label_") else column.replace("label_", "ret_top5_")
-        result[output] = top5[column].mean()
+        top5_rows = grouped.head(5)
+        top5 = top5_rows.groupby(group_columns, sort=False)[numeric_labels].mean()
+        top5.columns = [
+            column.replace("past_label_", "past_top5_")
+            if column.startswith("past_label_")
+            else column.replace("label_", "ret_top5_")
+            for column in top5.columns
+        ]
+        result = result.join(top5)
     return result.reset_index()
 
 
@@ -86,17 +119,20 @@ def build_theme_returns_one(
         return {"stage": "theme_returns", "status": "skipped", "date": part.date, "layer_id": part.layer_id, "scale": part.scale}
 
     labels = load_labels(label_path(labels_root, part.date), horizons)
-    labels_by_time = {key: value for key, value in labels.groupby("decision_time", sort=False, dropna=False)}
+    labels_indexed = labels.set_index("decision_time", drop=False).sort_index()
     members = read_partition(
         part.base,
         ["decision_time", "layer_id", "scale", "level", "theme_id", "member_id", "core_score", "rank_in_theme"],
         max_row_groups,
     )
+    if members.empty:
+        write_manifest(output_dir, {"stage": "theme_returns", "status": "empty", "output_rows": 0})
+        return {"stage": "theme_returns", "status": "empty", "date": part.date, "layer_id": part.layer_id, "scale": part.scale}
     if "decision_time" not in members or members["decision_time"].isna().all():
         members["decision_time"] = parse_theme_ts_series(members["theme_id"])
     members["decision_time"] = pd.to_datetime(members["decision_time"], utc=True, errors="coerce")
     members["member_id"] = pd.to_numeric(members["member_id"], errors="coerce").astype("Int64")
-    members["core_score"] = pd.to_numeric(members.get("core_score", 0), errors="coerce").fillna(0.0)
+    members["core_score"] = pd.to_numeric(members.get("core_score", 0), errors="coerce").fillna(0.0).astype("float32")
     members = members.dropna(subset=["decision_time", "member_id", "theme_id"]).copy()
     members["member_id"] = members["member_id"].astype("int64")
     if "level" not in members:
@@ -110,18 +146,19 @@ def build_theme_returns_one(
 
     def one(item: tuple[pd.Timestamp, pd.DataFrame]) -> pd.DataFrame | None:
         decision_time, membership = item
-        return _aggregate_theme_returns(membership, labels_by_time.get(decision_time, pd.DataFrame()), horizons)
+        return _aggregate_theme_returns(membership, _lookup_time(labels_indexed, decision_time), horizons)
 
-    groups = list(members.groupby("decision_time", sort=False, dropna=False))
+    groups = members.groupby("decision_time", sort=False, dropna=False)
     if inner_workers > 1:
-        def frames() -> Iterable[pd.DataFrame | None]:
-            with cf.ThreadPoolExecutor(max_workers=inner_workers) as executor:
-                futures = [executor.submit(one, item) for item in groups]
-                for future in cf.as_completed(futures):
-                    yield future.result()
-        rows, batches = stream_frames(output_path, frames())
+        frames: Iterable[pd.DataFrame | None] = bounded_thread_map(
+            groups,
+            inner_workers,
+            one,
+            max_in_flight=inner_workers * 2,
+        )
     else:
-        rows, batches = stream_frames(output_path, (one(item) for item in groups))
+        frames = (one(item) for item in groups)
+    rows, batches = stream_frames(output_path, frames)
 
     metadata = {
         "stage": "theme_returns",
@@ -133,6 +170,8 @@ def build_theme_returns_one(
         "write_batches": batches,
         "output": str(output_path),
         "past_return_availability": "actual_label_exit_time",
+        "input_grouping": "lazy_bounded_decision_time",
+        "inner_workers": inner_workers,
         "elapsed_sec": round(time.time() - started, 3),
     }
     write_manifest(output_dir, metadata)
@@ -146,7 +185,7 @@ def expand_symmetric_relations(edges: pd.DataFrame) -> pd.DataFrame:
     reverse = edges.copy()
     reverse[["src_theme_id", "dst_theme_id"]] = reverse[["dst_theme_id", "src_theme_id"]].to_numpy()
     expanded = pd.concat([edges, reverse], ignore_index=True)
-    keys = [c for c in ["decision_time", "layer_id", "scale", "level", "src_theme_id", "dst_theme_id"] if c in expanded]
+    keys = [column for column in ["decision_time", "layer_id", "scale", "level", "src_theme_id", "dst_theme_id"] if column in expanded]
     return expanded.drop_duplicates(keys, keep="first")
 
 
@@ -162,6 +201,7 @@ def _relation_signal_frame(
         source_returns,
         on=["decision_time", "layer_id", "scale", "level", "src_theme_id"],
         how="inner",
+        copy=False,
     )
     if merged.empty:
         return None
@@ -194,6 +234,7 @@ def _relation_signal_frame(
         target_returns,
         on=["decision_time", "layer_id", "scale", "level", "dst_theme_id"],
         how="inner",
+        copy=False,
     )
     if output.empty:
         return None
@@ -202,7 +243,7 @@ def _relation_signal_frame(
     available_column = f"src_past_available_time_{past_horizon}"
     if available_column in merged:
         latest = merged.groupby(group_columns, sort=False)[available_column].max().reset_index()
-        output = output.merge(latest, on=group_columns, how="left")
+        output = output.merge(latest, on=group_columns, how="left", copy=False)
         valid = output[available_column].notna()
         if valid.any() and not (output.loc[valid, available_column] <= output.loc[valid, "feature_time"]).all():
             raise AssertionError("source past return is not available at feature_time")
@@ -230,7 +271,7 @@ def relation_spillover_one(
     if not returns_path.exists():
         return {"stage": "relation_spillover", "status": "missing_theme_returns", "date": part.date, "layer_id": part.layer_id, "scale": part.scale}
 
-    returns = pd.read_parquet(returns_path)
+    returns = read_partition(returns_path)
     returns["decision_time"] = pd.to_datetime(returns["decision_time"], utc=True, errors="coerce")
     returns["layer_id"] = returns["layer_id"].astype(str)
     returns["scale"] = returns["scale"].astype(str)
@@ -267,7 +308,8 @@ def relation_spillover_one(
             else:
                 rename[column] = column
     target = returns[target_columns].rename(columns=rename)
-    target_by_time = {key: value for key, value in target.groupby("decision_time", sort=False, dropna=False)}
+    target_indexed = target.set_index("decision_time", drop=False).sort_index()
+    del returns, target
 
     edges = read_partition(
         part.base,
@@ -288,33 +330,40 @@ def relation_spillover_one(
         edges["scale"] = part.scale
     edges["layer_id"] = edges["layer_id"].astype(str)
     edges["scale"] = edges["scale"].astype(str)
-    edges = expand_symmetric_relations(edges)
+    edges_indexed = edges.set_index("decision_time", drop=False).sort_index()
+    del edges
 
     def one(item: tuple[pd.Timestamp, pd.DataFrame]) -> pd.DataFrame | None:
         decision_time, source_at_time = item
-        edge_at_time = edges[edges["decision_time"].eq(decision_time)]
-        return _relation_signal_frame(edge_at_time, source_at_time, target_by_time.get(decision_time, pd.DataFrame()), past_horizon)
+        edge_at_time = _lookup_time(edges_indexed, decision_time)
+        if edge_at_time.empty:
+            return None
+        edge_at_time = expand_symmetric_relations(edge_at_time)
+        return _relation_signal_frame(
+            edge_at_time,
+            source_at_time,
+            _lookup_time(target_indexed, decision_time),
+            past_horizon,
+        )
 
-    groups = list(source.groupby("decision_time", sort=False, dropna=False))
+    groups = source.groupby("decision_time", sort=False, dropna=False)
     if inner_workers > 1:
-        def frames() -> Iterable[pd.DataFrame | None]:
-            with cf.ThreadPoolExecutor(max_workers=inner_workers) as executor:
-                futures = [executor.submit(one, item) for item in groups]
-                for future in cf.as_completed(futures):
-                    frame = future.result()
-                    if frame is not None:
-                        frame.insert(1, "date", part.date)
-                    yield frame
-        rows, batches = stream_frames(output_path, frames())
+        base_frames: Iterable[pd.DataFrame | None] = bounded_thread_map(
+            groups,
+            inner_workers,
+            one,
+            max_in_flight=inner_workers * 2,
+        )
     else:
-        def frames() -> Iterable[pd.DataFrame | None]:
-            for item in groups:
-                frame = one(item)
-                if frame is not None:
-                    frame.insert(1, "date", part.date)
-                yield frame
-        rows, batches = stream_frames(output_path, frames())
+        base_frames = (one(item) for item in groups)
 
+    def frames() -> Iterable[pd.DataFrame | None]:
+        for frame in base_frames:
+            if frame is not None:
+                frame.insert(1, "date", part.date)
+            yield frame
+
+    rows, batches = stream_frames(output_path, frames())
     metadata = {
         "stage": "relation_spillover",
         "status": "complete" if rows else "empty",
@@ -323,6 +372,9 @@ def relation_spillover_one(
         "scale": part.scale,
         "past_horizon": past_horizon,
         "relation_semantics": "symmetric_neighbor_diffusion",
+        "symmetric_expansion_scope": "single_snapshot",
+        "input_grouping": "lazy_bounded_decision_time",
+        "inner_workers": inner_workers,
         "output_rows": rows,
         "write_batches": batches,
         "output": str(output_path),
