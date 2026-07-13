@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import time
 import types
 from pathlib import Path
 
@@ -17,7 +18,11 @@ stub.DEFAULT_INTRADAY_HORIZONS = ["5m", "15m", "30m"]
 stub.PIT_CONTRACT_VERSION = "p2-pit-v2"
 sys.modules.setdefault("p2_alpha_pit_features", stub)
 
-from p2_parallel_runtime import bounded_thread_map
+from p2_parallel_runtime import (
+    bounded_thread_map,
+    bounded_thread_map_ordered,
+    resolve_max_tasks_per_child,
+)
 from run_p2_24core_scheduler import build_plan
 
 
@@ -39,6 +44,16 @@ def test_safe_profile_leaves_more_ram_than_balanced():
     assert safe["relation-spillover"].workers <= balanced["relation-spillover"].workers
 
 
+def test_worker_recycling_has_unambiguous_semantics(monkeypatch):
+    monkeypatch.delenv("GFF_MAX_TASKS_PER_CHILD", raising=False)
+    assert resolve_max_tasks_per_child(None) == 8
+    monkeypatch.setenv("GFF_MAX_TASKS_PER_CHILD", "6")
+    assert resolve_max_tasks_per_child(None) == 6
+    assert resolve_max_tasks_per_child(8) == 8
+    assert resolve_max_tasks_per_child(1) == 1
+    assert resolve_max_tasks_per_child(0) is None
+
+
 def test_bounded_thread_map_does_not_materialize_entire_input():
     consumed: list[int] = []
 
@@ -53,3 +68,23 @@ def test_bounded_thread_map_does_not_materialize_entire_input():
     assert len(consumed) <= 3
     list(iterator)
     assert len(consumed) == 100
+
+
+def test_ordered_thread_map_keeps_order_and_bounded_reorder_window():
+    consumed: list[int] = []
+
+    def source():
+        for value in range(20):
+            consumed.append(value)
+            yield value
+
+    def slow(value: int) -> int:
+        if value == 0:
+            time.sleep(0.05)
+        return value
+
+    iterator = bounded_thread_map_ordered(source(), 4, slow, max_in_flight=4)
+    first = next(iterator)
+    assert first == 0
+    assert len(consumed) <= 5
+    assert [first, *list(iterator)] == list(range(20))
