@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Parallel P0 alpha evaluator with partitioned metrics and bounded memory."""
+"""Parallel P0 alpha evaluator with exact pairwise metrics and bounded memory."""
 from __future__ import annotations
 
 import hashlib
@@ -16,6 +16,7 @@ import pandas as pd
 from p2_parallel_runtime import collect_process_map
 from p2_pit_core import ext, iter_time_groups, stream_frames, write_manifest
 
+EVAL_CONTRACT_VERSION = "p0-eval-pairwise-mask-v2"
 SUMMARY_KEYS = ["kind", "feature", "target", "layer_id", "scale"]
 SUMMARY_COLUMNS = [
     *SUMMARY_KEYS,
@@ -36,53 +37,164 @@ def _target_column(column: str) -> bool:
     return bool(re.fullmatch(r"(?:label_|target_)\d+m", column))
 
 
+def _validity_groups(frame: pd.DataFrame, columns: list[str]) -> list[tuple[np.ndarray, list[str]]]:
+    """Group columns that share the same non-null row mask.
+
+    Pairwise-complete Spearman and spread calculations are exact when all columns
+    in a feature group and target group are evaluated on their intersected mask.
+    Grouping masks keeps the old semantics while retaining matrix operations.
+    """
+    groups: dict[tuple[int, bytes], tuple[np.ndarray, list[str]]] = {}
+    for column in columns:
+        mask = frame[column].notna().to_numpy(dtype=np.bool_, copy=False)
+        key = (len(mask), np.packbits(mask, bitorder="little").tobytes())
+        if key not in groups:
+            groups[key] = (mask, [column])
+        else:
+            groups[key][1].append(column)
+    return list(groups.values())
+
+
+def _rank_correlation_matrix(features: pd.DataFrame, targets: pd.DataFrame) -> np.ndarray:
+    """Pearson correlation of average ranks for complete matrices.
+
+    Inputs are already restricted to the exact pairwise-valid rows for every
+    cross-product pair in the two column groups.
+    """
+    feature_ranks = features.rank(axis=0, method="average")
+    target_ranks = targets.rank(axis=0, method="average")
+    feature_centered = feature_ranks - feature_ranks.mean(axis=0)
+    target_centered = target_ranks - target_ranks.mean(axis=0)
+
+    feature_values = feature_centered.to_numpy(dtype=np.float64, copy=False)
+    target_values = target_centered.to_numpy(dtype=np.float64, copy=False)
+    numerator = feature_values.T @ target_values
+    feature_norm = np.sqrt(np.square(feature_values).sum(axis=0))
+    target_norm = np.sqrt(np.square(target_values).sum(axis=0))
+    denominator = np.outer(feature_norm, target_norm)
+    return np.divide(
+        numerator,
+        denominator,
+        out=np.full(numerator.shape, np.nan, dtype=np.float64),
+        where=denominator > 0,
+    )
+
+
+def _spread_matrix(features: pd.DataFrame, targets: pd.DataFrame) -> np.ndarray:
+    """Pairwise top-minus-bottom spread using the legacy 80/20 definition."""
+    feature_values = features.to_numpy(dtype=np.float64, copy=False)
+    target_values = targets.to_numpy(dtype=np.float64, copy=False)
+    quantiles = features.quantile([0.8, 0.2], axis=0)
+    q80 = quantiles.loc[0.8].to_numpy(dtype=np.float64, copy=False)
+    q20 = quantiles.loc[0.2].to_numpy(dtype=np.float64, copy=False)
+
+    high = feature_values >= q80.reshape(1, -1)
+    low = feature_values <= q20.reshape(1, -1)
+    high_count = high.sum(axis=0).astype(np.float64)
+    low_count = low.sum(axis=0).astype(np.float64)
+    high_sum = high.astype(np.float64).T @ target_values
+    low_sum = low.astype(np.float64).T @ target_values
+    high_mean = np.divide(
+        high_sum,
+        high_count.reshape(-1, 1),
+        out=np.full(high_sum.shape, np.nan, dtype=np.float64),
+        where=high_count.reshape(-1, 1) > 0,
+    )
+    low_mean = np.divide(
+        low_sum,
+        low_count.reshape(-1, 1),
+        out=np.full(low_sum.shape, np.nan, dtype=np.float64),
+        where=low_count.reshape(-1, 1) > 0,
+    )
+    return high_mean - low_mean
+
+
+def _evaluate_one_time(
+    subset: pd.DataFrame,
+    date: str,
+    kind: str,
+    decision_time,
+    layer_id,
+    scale,
+    features: list[str],
+    targets: list[str],
+) -> list[dict]:
+    rows: list[dict] = []
+    if len(subset) < 30 or not features or not targets:
+        return rows
+
+    feature_groups = _validity_groups(subset, features)
+    target_groups = _validity_groups(subset, targets)
+    for feature_mask, feature_columns in feature_groups:
+        for target_mask, target_columns in target_groups:
+            pair_mask = feature_mask & target_mask
+            sample_count = int(pair_mask.sum())
+            if sample_count < 30:
+                continue
+
+            pair_features = subset.loc[pair_mask, feature_columns]
+            pair_targets = subset.loc[pair_mask, target_columns]
+            correlations = _rank_correlation_matrix(pair_features, pair_targets)
+            spreads = _spread_matrix(pair_features, pair_targets)
+
+            for feature_index, feature in enumerate(feature_columns):
+                for target_index, target in enumerate(target_columns):
+                    rows.append(
+                        {
+                            "date": date,
+                            "decision_time": decision_time,
+                            "kind": kind,
+                            "layer_id": layer_id,
+                            "scale": scale,
+                            "feature": feature,
+                            "target": target,
+                            "sample_count": sample_count,
+                            "rank_ic": correlations[feature_index, target_index],
+                            "top_minus_bottom": spreads[feature_index, target_index],
+                        }
+                    )
+    return rows
+
+
 def _evaluate_snapshot(frame: pd.DataFrame, date: str, kind: str) -> pd.DataFrame:
     if "pit_audit_pass" in frame and not bool(frame["pit_audit_pass"].fillna(False).all()):
         raise AssertionError("refusing P0 evaluation with failed PIT rows")
+    required = {"decision_time", "layer_id", "scale"}
+    if missing := required - set(frame):
+        raise ValueError(f"P0 evaluation input missing required columns {sorted(missing)}")
+    if frame["layer_id"].isna().any() or frame["layer_id"].nunique(dropna=False) != 1:
+        raise ValueError("P0 evaluation partition contains mixed or missing layer_id")
+    if frame["scale"].isna().any() or frame["scale"].nunique(dropna=False) != 1:
+        raise ValueError("P0 evaluation partition contains mixed or missing scale")
+
     targets = [column for column in frame if _target_column(column)]
     features = [
         column
         for column in frame
         if column.startswith("p0_") and pd.api.types.is_numeric_dtype(frame[column])
     ]
+    if not targets or not features:
+        return pd.DataFrame()
+
+    frame = frame.replace([np.inf, -np.inf], np.nan)
+    layer_id = frame["layer_id"].iloc[0]
+    scale = frame["scale"].iloc[0]
     rows: list[dict] = []
-    for keys, subset in frame.groupby(
-        ["decision_time", "layer_id", "scale"],
-        dropna=False,
-        sort=False,
-    ):
-        for feature in features:
-            for target in targets:
-                values = (
-                    subset[[feature, target]]
-                    .replace([np.inf, -np.inf], np.nan)
-                    .dropna()
-                )
-                if len(values) < 30:
-                    continue
-                q80 = values[feature].quantile(0.8)
-                q20 = values[feature].quantile(0.2)
-                if values[feature].nunique() < 2 or values[target].nunique() < 2:
-                    rank_ic = np.nan
-                else:
-                    rank_ic = values[feature].rank().corr(values[target].rank())
-                rows.append(
-                    {
-                        "date": date,
-                        "decision_time": keys[0],
-                        "kind": kind,
-                        "layer_id": keys[1],
-                        "scale": keys[2],
-                        "feature": feature,
-                        "target": target,
-                        "sample_count": len(values),
-                        "rank_ic": rank_ic,
-                        "top_minus_bottom": (
-                            values.loc[values[feature] >= q80, target].mean()
-                            - values.loc[values[feature] <= q20, target].mean()
-                        ),
-                    }
-                )
+    for decision_time, subset in frame.groupby("decision_time", sort=False, dropna=False):
+        if pd.isna(decision_time):
+            continue
+        rows.extend(
+            _evaluate_one_time(
+                subset,
+                date,
+                kind,
+                decision_time,
+                layer_id,
+                scale,
+                features,
+                targets,
+            )
+        )
     return pd.DataFrame(rows)
 
 
@@ -104,12 +216,7 @@ def _update_summary(accumulator: dict, metrics: pd.DataFrame) -> None:
                 "positive_count": 0,
             },
         )
-        timestamps = (
-            pd.to_datetime(subset["decision_time"], utc=True, errors="coerce")
-            .dropna()
-            .astype(str)
-            .tolist()
-        )
+        timestamps = subset["decision_time"].dropna().astype(str).tolist()
         state["snapshots"].update(timestamps)
         state["sample_count"] += int(subset["sample_count"].sum())
         rank = pd.to_numeric(subset["rank_ic"], errors="coerce")
@@ -268,6 +375,7 @@ def p0_eval_complete(output_dir: str | Path) -> bool:
         )
         return (
             payload.get("status") == "complete"
+            and payload.get("evaluation_contract_version") == EVAL_CONTRACT_VERSION
             and (output_dir / "p0_alpha_metrics.parquet").is_dir()
             and (output_dir / "p0_alpha_summary.csv").exists()
         )
@@ -283,7 +391,7 @@ def evaluate_p0_streaming(
     csv_mode: str = "none",
     skip_existing: bool = False,
 ) -> dict:
-    """Evaluate P0 partitions in parallel.
+    """Evaluate P0 partitions in parallel with exact pairwise-complete metrics.
 
     The canonical metrics artifact is a partitioned Parquet dataset at
     ``p0_alpha_metrics.parquet/``. Full CSV output is optional because serial
@@ -300,6 +408,7 @@ def evaluate_p0_streaming(
             "stage": "p0_alpha_eval",
             "status": "skipped",
             "month": month,
+            "evaluation_contract_version": EVAL_CONTRACT_VERSION,
             "elapsed_sec": 0.0,
         }
 
@@ -316,6 +425,7 @@ def evaluate_p0_streaming(
             "input_files": 0,
             "output_rows": 0,
             "month": month,
+            "evaluation_contract_version": EVAL_CONTRACT_VERSION,
         }
         write_manifest(output_dir, metadata)
         return metadata
@@ -339,7 +449,7 @@ def evaluate_p0_streaming(
             str(metric_work),
             csv_dir_arg,
             max_in_flight=worker_count * 2,
-            max_tasks_per_child=1,
+            max_tasks_per_child=None,
         )
         metric_rows = int(sum(result["rows"] for result in results))
         metric_shards = [
@@ -389,6 +499,8 @@ def evaluate_p0_streaming(
             "output_rows": metric_rows,
             "evaluation_scope": "per_decision_time_cross_section",
             "evaluation_input_mode": "parallel_partition_metric_shards",
+            "evaluation_contract_version": EVAL_CONTRACT_VERSION,
+            "missing_data_semantics": "exact_pairwise_complete_by_validity_mask",
             "metrics_layout": "partitioned_parquet_dataset",
             "metrics_path": str(final_metrics),
             "csv_mode": csv_mode,
