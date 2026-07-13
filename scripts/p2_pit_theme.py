@@ -15,7 +15,7 @@ from p2_pit_core import *
 
 def _lookup_time(indexed: pd.DataFrame, decision_time: pd.Timestamp) -> pd.DataFrame:
     try:
-        return indexed.loc[[decision_time]]
+        return indexed.loc[[decision_time]].reset_index(drop=True)
     except KeyError:
         return pd.DataFrame(columns=indexed.columns)
 

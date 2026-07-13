@@ -26,14 +26,14 @@ THREAD_CAPS = {
 }
 
 BASE_GB_PER_PROCESS = {
-    "p0-node-features": 4.5,
-    "p0-edge-spillover": 5.5,
+    "p0-node-features": 3.8,
+    "p0-edge-spillover": 3.8,
     "p0-graph-state": 2.0,
-    "p0-eval": 3.0,
-    "build-theme-returns": 10.0,
-    "relation-spillover": 9.0,
-    "intraday-relation-features": 3.5,
-    "daily-relation-features": 7.0,
+    "p0-eval": 3.8,
+    "build-theme-returns": 3.8,
+    "relation-spillover": 3.8,
+    "intraday-relation-features": 3.8,
+    "daily-relation-features": 3.8,
     "p2-eval": 3.0,
 }
 PROFILE_MEMORY_MULTIPLIER = {"safe": 1.25, "balanced": 1.0, "aggressive": 0.90, "max": 0.85}
