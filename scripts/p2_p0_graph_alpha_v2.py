@@ -67,6 +67,8 @@ def main() -> None:
     evaluate.add_argument("--out-dir", required=True)
     evaluate.add_argument("--workers", type=int, default=12)
     evaluate.add_argument("--month")
+    evaluate.add_argument("--csv-mode", choices=["none", "sharded", "single"], default="none")
+    evaluate.add_argument("--skip-existing", action="store_true")
     args = parser.parse_args()
 
     if args.command == "eval-p0":
@@ -75,6 +77,8 @@ def main() -> None:
             args.out_dir,
             args.workers,
             args.month,
+            args.csv_mode,
+            args.skip_existing,
         )
     else:
         dates, layers, scales = csvset(args.dates), csvset(args.layers), csvset(args.scales)
