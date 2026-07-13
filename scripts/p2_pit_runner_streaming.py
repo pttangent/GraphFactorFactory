@@ -2,6 +2,7 @@
 """Streaming partition runner for PIT relation features."""
 from __future__ import annotations
 
+import json
 import time
 from collections.abc import Iterable
 from pathlib import Path
@@ -35,6 +36,28 @@ def _checked_intraday_frames(
         yield output
 
 
+def _load_temporal_edges(
+    temporal_root: str | Path,
+    part: Part,
+    max_row_groups: int | None,
+) -> tuple[pd.DataFrame, str]:
+    partition_dir = Path(temporal_root) / f"date={part.date}" / f"layer_id={part.layer_id}" / f"scale={part.scale}"
+    temporal_path = partition_dir / "temporal_theme_edges.parquet"
+    if temporal_path.exists():
+        return read_partition(temporal_path, None, max_row_groups), "p1_temporal_edges"
+
+    manifest_path = partition_dir / "manifest.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception as error:
+        raise FileNotFoundError(f"missing daily temporal identity file and readable manifest: {temporal_path}") from error
+    temporal_rows = int(manifest.get("rows", {}).get("temporal_theme_edges", -1))
+    if manifest.get("status") in {"complete", "empty"} and temporal_rows == 0:
+        empty = pd.DataFrame(columns=["level", "src_theme_id", "dst_theme_id", "src_time", "dst_time"])
+        return empty, "p1_complete_zero_temporal_edges_singleton_episodes"
+    raise FileNotFoundError(f"missing daily temporal identity file: {temporal_path}")
+
+
 def build_feature_one(
     part: Part,
     output_root: str | Path,
@@ -54,6 +77,7 @@ def build_feature_one(
 
     output_rows = write_batches = 0
     input_mode = "full_session_required"
+    temporal_identity = "not_applicable"
     if mode == "intraday":
         output_rows, write_batches = stream_frames(
             output_path,
@@ -65,11 +89,8 @@ def build_feature_one(
         if not source.empty:
             if temporal_root is None:
                 raise ValueError("daily mode requires --p1-root with temporal_theme_edges.parquet")
-            temporal_path = Path(temporal_root) / f"date={part.date}" / f"layer_id={part.layer_id}" / f"scale={part.scale}" / "temporal_theme_edges.parquet"
-            if not temporal_path.exists():
-                raise FileNotFoundError(f"missing daily temporal identity file: {temporal_path}")
-            temporal = read_partition(temporal_path, None, max_row_groups)
-            if "level" in temporal:
+            temporal, temporal_identity = _load_temporal_edges(temporal_root, part, max_row_groups)
+            if "level" in temporal and not temporal.empty:
                 temporal = temporal[temporal["level"].astype(str).isin(source["level"].astype(str).unique())]
             output = build_daily_feature_frame(source, underreaction_past_horizon, late_minutes, temporal)
             if not output.empty:
@@ -92,7 +113,7 @@ def build_feature_one(
         "late_minutes": late_minutes if mode == "daily" else None,
         "underreaction_past_horizon": underreaction_past_horizon,
         "normalization_scope": "snapshot_cross_section" if mode == "intraday" else "eod_cross_section",
-        "temporal_identity": "not_applicable" if mode == "intraday" else "p1_temporal_episode",
+        "temporal_identity": temporal_identity,
         "input_mode": input_mode,
         "output": str(output_path),
         "elapsed_sec": round(time.time() - started, 3),
