@@ -8,7 +8,6 @@ import multiprocessing as mp
 import os
 import signal
 import subprocess
-from collections import deque
 from collections.abc import Iterable, Iterator
 from typing import Any, Callable, TypeVar
 
@@ -22,6 +21,26 @@ def _positive_int_env(name: str, default: int) -> int:
     except (TypeError, ValueError):
         return default
     return max(1, value)
+
+
+def _nonnegative_int_env(name: str, default: int) -> int:
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+    return max(0, value)
+
+
+def resolve_max_tasks_per_child(value: int | None) -> int | None:
+    """Resolve worker recycling without conflating ``None`` and one task.
+
+    ``None`` means use ``GFF_MAX_TASKS_PER_CHILD`` (default 8). ``0`` disables
+    recycling for the lifetime of the pool. A positive integer recycles after
+    exactly that many completed tasks. This avoids Windows spawn/import storms
+    while keeping a bounded option for long-running Pandas/Arrow workers.
+    """
+    resolved = _nonnegative_int_env("GFF_MAX_TASKS_PER_CHILD", 8) if value is None else max(0, int(value))
+    return None if resolved == 0 else resolved
 
 
 def bounded_thread_map(
@@ -72,24 +91,26 @@ def bounded_thread_map_ordered(
     *,
     max_in_flight: int | None = None,
 ) -> Iterator[R]:
-    """Yield bounded thread results in input order.
+    """Yield bounded thread results in input order without head-of-line idling.
 
-    This is required for parquet stages whose downstream consumers merge sorted
-    ``decision_time`` streams. Parallel work remains bounded, while output order
-    is deterministic even when later snapshots finish first.
+    Completed later snapshots are buffered by sequence number while the executor
+    immediately receives replacement work. Output remains deterministic and
+    sorted, but one slow early snapshot no longer leaves the other threads idle.
     """
     workers = max(1, int(workers))
     limit = max(workers, int(max_in_flight or workers * 2))
-    iterator = iter(items)
+    iterator = enumerate(items)
     executor = cf.ThreadPoolExecutor(max_workers=workers)
-    pending: deque[cf.Future[R]] = deque()
+    pending: dict[cf.Future[R], int] = {}
+    ready: dict[int, R] = {}
+    next_output = 0
 
     def submit_one() -> bool:
         try:
-            item = next(iterator)
+            index, item = next(iterator)
         except StopIteration:
             return False
-        pending.append(executor.submit(function, item))
+        pending[executor.submit(function, item)] = index
         return True
 
     try:
@@ -97,10 +118,14 @@ def bounded_thread_map_ordered(
             if not submit_one():
                 break
         while pending:
-            future = pending.popleft()
-            result = future.result()
-            submit_one()
-            yield result
+            done, _ = cf.wait(set(pending), return_when=cf.FIRST_COMPLETED)
+            for future in done:
+                index = pending.pop(future)
+                ready[index] = future.result()
+                submit_one()
+            while next_output in ready:
+                yield ready.pop(next_output)
+                next_output += 1
     except BaseException:
         for future in pending:
             future.cancel()
@@ -118,10 +143,10 @@ def bounded_process_map(
     max_in_flight: int | None = None,
     max_tasks_per_child: int | None = None,
 ) -> Iterator[R]:
-    """Yield process results with bounded submissions and recyclable workers."""
+    """Yield process results with bounded submissions and controlled recycling."""
     workers = max(1, int(workers))
     limit = max(workers, int(max_in_flight or workers * 2))
-    recycle_after = max_tasks_per_child or _positive_int_env("GFF_MAX_TASKS_PER_CHILD", 1)
+    recycle_after = resolve_max_tasks_per_child(max_tasks_per_child)
     iterator = iter(items)
     context = mp.get_context("spawn")
     executor = cf.ProcessPoolExecutor(
