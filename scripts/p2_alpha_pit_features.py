@@ -14,13 +14,14 @@ from p2_pit_core import *
 from p2_pit_features import *
 from p2_pit_runner_streaming import build_feature_one
 from p2_pit_theme import *
-from p2_pit_theme_streaming import build_theme_returns_one, relation_spillover_one
+from p2_pit_theme_streaming import relation_spillover_one
 from p2_streaming_io import stream_frames
+from p2_theme_date_runner import build_theme_returns_date, group_parts_by_date
 
 os.environ.setdefault("GFF_MIN_FREE_GB", "50")
 
 
-def pool(parts: list[Part], workers: int, function, *args) -> list[dict]:
+def pool(parts, workers: int, function, *args, tasks_per_child: int = 8):
     if not parts:
         return []
     worker_count = max(1, min(int(workers), len(parts)))
@@ -30,7 +31,7 @@ def pool(parts: list[Part], workers: int, function, *args) -> list[dict]:
         function,
         *args,
         max_in_flight=worker_count * 2,
-        max_tasks_per_child=8,
+        max_tasks_per_child=tasks_per_child,
     )
 
 
@@ -109,7 +110,21 @@ def main() -> None:
 
     if args.command == "build-theme-returns":
         parts = discover(args.p1_root, "theme_memberships.parquet", dates, layers, scales)
-        results = pool(parts, args.workers, build_theme_returns_one, args.labels_root, args.out_root, horizons, levels, args.skip_existing, args.max_row_groups, args.inner_workers)
+        date_batches = group_parts_by_date(parts)
+        nested = pool(
+            date_batches,
+            args.workers,
+            build_theme_returns_date,
+            args.labels_root,
+            args.out_root,
+            horizons,
+            levels,
+            args.skip_existing,
+            args.max_row_groups,
+            args.inner_workers,
+            tasks_per_child=1,
+        )
+        results = [item for batch in nested for item in batch]
         save_run_summary(args.out_root, results)
     elif args.command == "relation-spillover":
         parts = discover(args.p1_root, "theme_relation_edges.parquet", dates, layers, scales)
