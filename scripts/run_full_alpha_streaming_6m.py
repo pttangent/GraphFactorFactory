@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Six-month local/NAS runner for the PIT-safe P0/P2 pipeline.
 
-Copy, daily-label injection, compute, evaluation and cleanup are strictly
-serialized. Monthly evaluation is performed exactly once by the scheduler.
+Copy, label injection, strict P0 edge sharding, compute, evaluation and cleanup
+are serialized. Monthly evaluation is performed exactly once by the scheduler.
 """
 from __future__ import annotations
 
@@ -20,6 +20,7 @@ NAS_P0_ROOT = Path(r"P:\US-Stock\GFF_Full_Workspace\graph_store_6m\canonical")
 NAS_P1_ROOT = Path(r"P:\US-Stock\GFF_Full_Workspace\p1_b50_b35_sharded")
 LOCAL_WORKSPACE = Path(r"D:\GFF_Streaming_Workspace")
 LOCAL_P0 = LOCAL_WORKSPACE / "p0"
+LOCAL_P0_SHARDS = LOCAL_WORKSPACE / "p0_alpha_shards"
 LOCAL_P1 = LOCAL_WORKSPACE / "p1"
 LOCAL_P2_OUT = LOCAL_WORKSPACE / "p2_out"
 NAS_P2_OUT = Path(r"P:\US-Stock\GFF_Full_Workspace\p2_alpha_full_run")
@@ -70,15 +71,31 @@ def inject_month_labels(month: str) -> None:
     print(f"[{time.strftime('%H:%M:%S')}] injected next-open labels: {report}", flush=True)
 
 
+def build_p0_alpha_shards(dates: list[str]) -> None:
+    """Create real date/layer/scale partitions before P0 alpha extraction."""
+    shutil.rmtree(LOCAL_P0_SHARDS, ignore_errors=True)
+    LOCAL_P0_SHARDS.mkdir(parents=True, exist_ok=True)
+    print(f"[{time.strftime('%H:%M:%S')}] building strict P0 alpha shards", flush=True)
+    run([
+        sys.executable,
+        "scripts/shard_p0_edges_by_layer_scale.py",
+        "--p0-root", str(LOCAL_P0),
+        "--out-root", str(LOCAL_P0_SHARDS),
+        "--dates", ",".join(dates),
+        "--batch-size", "250000",
+    ])
+
+
 def run_p2_month(month: str) -> None:
     dates = sorted(path.name.split("=", 1)[1] for path in LOCAL_P0.glob(f"date={month}-*"))
     if not dates:
         raise RuntimeError(f"no local P0 dates found for {month}")
     inject_month_labels(month)
+    build_p0_alpha_shards(dates)
     run([
         sys.executable,
         "scripts/run_p2_24core_scheduler.py",
-        "--p0-root", str(LOCAL_P0),
+        "--p0-root", str(LOCAL_P0_SHARDS),
         "--labels-root", str(LOCAL_P0),
         "--p1-root", str(LOCAL_P1),
         "--p2-root", str(LOCAL_P2_OUT),
@@ -101,6 +118,7 @@ def cleanup_month(month: str) -> None:
         shutil.rmtree(directory, ignore_errors=True)
     for directory in LOCAL_P1.glob(f"date={month}-*"):
         shutil.rmtree(directory, ignore_errors=True)
+    shutil.rmtree(LOCAL_P0_SHARDS, ignore_errors=True)
 
 
 def run_global_evaluation() -> None:
