@@ -10,12 +10,13 @@ from pathlib import Path
 import pandas as pd
 
 from p2_checkpoint import file_fingerprint, stage_checkpoint_valid
+from p2_daily_streaming import build_daily_feature_frame_streaming
 from p2_pit_core import Part, iter_time_groups, read_partition, write_manifest, write_parquet_atomic
-from p2_pit_features import build_daily_feature_frame, build_intraday_feature_frame
+from p2_pit_features import build_intraday_feature_frame
 from p2_streaming_io import stream_frames
 
 INTRADAY_FEATURE_CONTRACT = "intraday-relation-features-v3"
-DAILY_FEATURE_CONTRACT = "daily-relation-features-v3"
+DAILY_FEATURE_CONTRACT = "daily-relation-features-stream-v4"
 
 
 def _checked_intraday_frames(
@@ -105,30 +106,32 @@ def build_feature_one(
         return {"stage": f"{mode}_relation_features", "status": "skipped", "date": part.date, "layer_id": part.layer_id, "scale": part.scale}
 
     output_rows = write_batches = 0
-    input_mode = "full_session_required"
+    input_mode = "snapshot_time_stream"
     temporal_identity = "not_applicable"
     if mode == "intraday":
         output_rows, write_batches = stream_frames(
             output_path,
             _checked_intraday_frames(part.base, underreaction_past_horizon, max_row_groups),
         )
-        input_mode = "snapshot_time_stream"
     else:
-        source = read_partition(part.base, None, max_row_groups)
-        if not source.empty:
-            temporal, temporal_identity = _load_temporal_edges(temporal_root, part, max_row_groups)
-            if "level" in temporal and not temporal.empty:
-                temporal = temporal[temporal["level"].astype(str).isin(source["level"].astype(str).unique())]
-            output = build_daily_feature_frame(source, underreaction_past_horizon, late_minutes, temporal)
-            if not output.empty:
-                if "pit_audit_pass" not in output or not bool(output["pit_audit_pass"].fillna(False).all()):
-                    failed = int((~output.get("pit_audit_pass", pd.Series(False, index=output.index)).fillna(False)).sum())
-                    raise AssertionError(f"{failed} daily feature rows failed PIT audit")
-                write_parquet_atomic(output, output_path)
-                output_rows = len(output)
-                write_batches = 1
-        if output_rows == 0:
+        temporal, temporal_identity = _load_temporal_edges(temporal_root, part, max_row_groups)
+        output = build_daily_feature_frame_streaming(
+            part.base,
+            underreaction_past_horizon,
+            late_minutes,
+            temporal,
+            max_row_groups,
+        )
+        if not output.empty:
+            if "pit_audit_pass" not in output or not bool(output["pit_audit_pass"].fillna(False).all()):
+                failed = int((~output.get("pit_audit_pass", pd.Series(False, index=output.index)).fillna(False)).sum())
+                raise AssertionError(f"{failed} daily feature rows failed PIT audit")
+            write_parquet_atomic(output, output_path)
+            output_rows = len(output)
+            write_batches = 1
+        else:
             output_path.unlink(missing_ok=True)
+        input_mode = "single_pass_episode_state_plus_rolling_late_window"
 
     metadata = {
         "stage": f"{mode}_relation_features",
@@ -145,6 +148,7 @@ def build_feature_one(
         "normalization_scope": "snapshot_cross_section" if mode == "intraday" else "eod_cross_section",
         "temporal_identity": temporal_identity,
         "input_mode": input_mode,
+        "maximum_full_signal_partitions_in_memory": 0 if mode == "daily" else None,
         "inputs": inputs,
         "config": config,
         "output": str(output_path),
