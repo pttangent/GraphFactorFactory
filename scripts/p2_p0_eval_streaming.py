@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Parallel P0 alpha evaluator with exact pairwise metrics and bounded memory."""
+"""Parallel, resumable P0 alpha evaluation with exact pairwise semantics."""
 from __future__ import annotations
 
 import hashlib
@@ -13,10 +13,12 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from p2_checkpoint import file_fingerprint, read_json, write_json_atomic
 from p2_parallel_runtime import collect_process_map
-from p2_pit_core import ext, iter_time_groups, stream_frames, write_manifest
+from p2_pit_core import ext, iter_time_groups, write_manifest
+from p2_streaming_io import stream_frames
 
-EVAL_CONTRACT_VERSION = "p0-eval-pairwise-mask-v2"
+EVAL_CONTRACT_VERSION = "p0-eval-pairwise-resumable-v3"
 SUMMARY_KEYS = ["kind", "feature", "target", "layer_id", "scale"]
 SUMMARY_COLUMNS = [
     *SUMMARY_KEYS,
@@ -29,21 +31,22 @@ SUMMARY_COLUMNS = [
 ]
 
 
-def _shard_name(path: Path) -> str:
-    return hashlib.sha1(str(path).encode("utf-8")).hexdigest()[:16]
+def _token(path: Path) -> str:
+    return hashlib.sha1(str(path.resolve()).encode("utf-8")).hexdigest()[:16]
 
 
 def _target_column(column: str) -> bool:
     return bool(re.fullmatch(r"(?:label_|target_)\d+m", column))
 
 
-def _validity_groups(frame: pd.DataFrame, columns: list[str]) -> list[tuple[np.ndarray, list[str]]]:
-    """Group columns that share the same non-null row mask.
+def _input_signature(files: list[Path]) -> str:
+    digest = hashlib.sha256()
+    for path in sorted(files, key=lambda value: str(value.resolve())):
+        digest.update(json.dumps(file_fingerprint(path), sort_keys=True).encode("utf-8"))
+    return digest.hexdigest()
 
-    Pairwise-complete Spearman and spread calculations are exact when all columns
-    in a feature group and target group are evaluated on their intersected mask.
-    Grouping masks keeps the old semantics while retaining matrix operations.
-    """
+
+def _validity_groups(frame: pd.DataFrame, columns: list[str]) -> list[tuple[np.ndarray, list[str]]]:
     groups: dict[tuple[int, bytes], tuple[np.ndarray, list[str]]] = {}
     for column in columns:
         mask = frame[column].notna().to_numpy(dtype=np.bool_, copy=False)
@@ -56,22 +59,15 @@ def _validity_groups(frame: pd.DataFrame, columns: list[str]) -> list[tuple[np.n
 
 
 def _rank_correlation_matrix(features: pd.DataFrame, targets: pd.DataFrame) -> np.ndarray:
-    """Pearson correlation of average ranks for complete matrices.
-
-    Inputs are already restricted to the exact pairwise-valid rows for every
-    cross-product pair in the two column groups.
-    """
     feature_ranks = features.rank(axis=0, method="average")
     target_ranks = targets.rank(axis=0, method="average")
-    feature_centered = feature_ranks - feature_ranks.mean(axis=0)
-    target_centered = target_ranks - target_ranks.mean(axis=0)
-
-    feature_values = feature_centered.to_numpy(dtype=np.float64, copy=False)
-    target_values = target_centered.to_numpy(dtype=np.float64, copy=False)
+    feature_values = (feature_ranks - feature_ranks.mean(axis=0)).to_numpy(dtype=np.float64, copy=False)
+    target_values = (target_ranks - target_ranks.mean(axis=0)).to_numpy(dtype=np.float64, copy=False)
     numerator = feature_values.T @ target_values
-    feature_norm = np.sqrt(np.square(feature_values).sum(axis=0))
-    target_norm = np.sqrt(np.square(target_values).sum(axis=0))
-    denominator = np.outer(feature_norm, target_norm)
+    denominator = np.outer(
+        np.sqrt(np.square(feature_values).sum(axis=0)),
+        np.sqrt(np.square(target_values).sum(axis=0)),
+    )
     return np.divide(
         numerator,
         denominator,
@@ -81,13 +77,11 @@ def _rank_correlation_matrix(features: pd.DataFrame, targets: pd.DataFrame) -> n
 
 
 def _spread_matrix(features: pd.DataFrame, targets: pd.DataFrame) -> np.ndarray:
-    """Pairwise top-minus-bottom spread using the legacy 80/20 definition."""
     feature_values = features.to_numpy(dtype=np.float64, copy=False)
     target_values = targets.to_numpy(dtype=np.float64, copy=False)
     quantiles = features.quantile([0.8, 0.2], axis=0)
     q80 = quantiles.loc[0.8].to_numpy(dtype=np.float64, copy=False)
     q20 = quantiles.loc[0.2].to_numpy(dtype=np.float64, copy=False)
-
     high = feature_values >= q80.reshape(1, -1)
     low = feature_values <= q20.reshape(1, -1)
     high_count = high.sum(axis=0).astype(np.float64)
@@ -107,53 +101,6 @@ def _spread_matrix(features: pd.DataFrame, targets: pd.DataFrame) -> np.ndarray:
         where=low_count.reshape(-1, 1) > 0,
     )
     return high_mean - low_mean
-
-
-def _evaluate_one_time(
-    subset: pd.DataFrame,
-    date: str,
-    kind: str,
-    decision_time,
-    layer_id,
-    scale,
-    features: list[str],
-    targets: list[str],
-) -> list[dict]:
-    rows: list[dict] = []
-    if len(subset) < 30 or not features or not targets:
-        return rows
-
-    feature_groups = _validity_groups(subset, features)
-    target_groups = _validity_groups(subset, targets)
-    for feature_mask, feature_columns in feature_groups:
-        for target_mask, target_columns in target_groups:
-            pair_mask = feature_mask & target_mask
-            sample_count = int(pair_mask.sum())
-            if sample_count < 30:
-                continue
-
-            pair_features = subset.loc[pair_mask, feature_columns]
-            pair_targets = subset.loc[pair_mask, target_columns]
-            correlations = _rank_correlation_matrix(pair_features, pair_targets)
-            spreads = _spread_matrix(pair_features, pair_targets)
-
-            for feature_index, feature in enumerate(feature_columns):
-                for target_index, target in enumerate(target_columns):
-                    rows.append(
-                        {
-                            "date": date,
-                            "decision_time": decision_time,
-                            "kind": kind,
-                            "layer_id": layer_id,
-                            "scale": scale,
-                            "feature": feature,
-                            "target": target,
-                            "sample_count": sample_count,
-                            "rank_ic": correlations[feature_index, target_index],
-                            "top_minus_bottom": spreads[feature_index, target_index],
-                        }
-                    )
-    return rows
 
 
 def _evaluate_snapshot(frame: pd.DataFrame, date: str, kind: str) -> pd.DataFrame:
@@ -181,29 +128,39 @@ def _evaluate_snapshot(frame: pd.DataFrame, date: str, kind: str) -> pd.DataFram
     scale = frame["scale"].iloc[0]
     rows: list[dict] = []
     for decision_time, subset in frame.groupby("decision_time", sort=False, dropna=False):
-        if pd.isna(decision_time):
+        if pd.isna(decision_time) or len(subset) < 30:
             continue
-        rows.extend(
-            _evaluate_one_time(
-                subset,
-                date,
-                kind,
-                decision_time,
-                layer_id,
-                scale,
-                features,
-                targets,
-            )
-        )
+        for feature_mask, feature_columns in _validity_groups(subset, features):
+            for target_mask, target_columns in _validity_groups(subset, targets):
+                pair_mask = feature_mask & target_mask
+                sample_count = int(pair_mask.sum())
+                if sample_count < 30:
+                    continue
+                pair_features = subset.loc[pair_mask, feature_columns]
+                pair_targets = subset.loc[pair_mask, target_columns]
+                correlations = _rank_correlation_matrix(pair_features, pair_targets)
+                spreads = _spread_matrix(pair_features, pair_targets)
+                for feature_index, feature in enumerate(feature_columns):
+                    for target_index, target in enumerate(target_columns):
+                        rows.append(
+                            {
+                                "date": date,
+                                "decision_time": decision_time,
+                                "kind": kind,
+                                "layer_id": layer_id,
+                                "scale": scale,
+                                "feature": feature,
+                                "target": target,
+                                "sample_count": sample_count,
+                                "rank_ic": correlations[feature_index, target_index],
+                                "top_minus_bottom": spreads[feature_index, target_index],
+                            }
+                        )
     return pd.DataFrame(rows)
 
 
 def _update_summary(accumulator: dict, metrics: pd.DataFrame) -> None:
-    for group_key, subset in metrics.groupby(
-        SUMMARY_KEYS,
-        sort=False,
-        dropna=False,
-    ):
+    for group_key, subset in metrics.groupby(SUMMARY_KEYS, sort=False, dropna=False):
         state = accumulator.setdefault(
             group_key,
             {
@@ -216,8 +173,7 @@ def _update_summary(accumulator: dict, metrics: pd.DataFrame) -> None:
                 "positive_count": 0,
             },
         )
-        timestamps = subset["decision_time"].dropna().astype(str).tolist()
-        state["snapshots"].update(timestamps)
+        state["snapshots"].update(subset["decision_time"].dropna().astype(str).tolist())
         state["sample_count"] += int(subset["sample_count"].sum())
         rank = pd.to_numeric(subset["rank_ic"], errors="coerce")
         spread = pd.to_numeric(subset["top_minus_bottom"], errors="coerce")
@@ -241,27 +197,23 @@ def _partial_summary_records(accumulator: dict, date: str) -> list[dict]:
                 "layer_id": layer_id,
                 "scale": scale,
                 "snapshots": len(state["snapshots"]),
-                "sample_count": state["sample_count"],
-                "rank_ic_sum": state["rank_ic_sum"],
-                "rank_ic_count": state["rank_ic_count"],
-                "spread_sum": state["spread_sum"],
-                "spread_count": state["spread_count"],
-                "positive_count": state["positive_count"],
+                "sample_count": int(state["sample_count"]),
+                "rank_ic_sum": float(state["rank_ic_sum"]),
+                "rank_ic_count": int(state["rank_ic_count"]),
+                "spread_sum": float(state["spread_sum"]),
+                "spread_count": int(state["spread_count"]),
+                "positive_count": int(state["positive_count"]),
             }
         )
     return records
 
 
-def _finalize_summary(records: list[dict]) -> pd.DataFrame:
-    if not records:
+def _summary_frame(records: list[dict] | pd.DataFrame) -> pd.DataFrame:
+    partial = records if isinstance(records, pd.DataFrame) else pd.DataFrame.from_records(records)
+    if partial.empty:
         return pd.DataFrame(columns=SUMMARY_COLUMNS)
-    partial = pd.DataFrame.from_records(records)
     rows: list[dict] = []
-    for key, subset in partial.groupby(
-        SUMMARY_KEYS,
-        sort=False,
-        dropna=False,
-    ):
+    for key, subset in partial.groupby(SUMMARY_KEYS, sort=False, dropna=False):
         kind, feature, target, layer_id, scale = key
         rank_count = int(subset["rank_ic_count"].sum())
         spread_count = int(subset["spread_count"].sum())
@@ -275,42 +227,46 @@ def _finalize_summary(records: list[dict]) -> pd.DataFrame:
                 "days": int(subset["date"].nunique()),
                 "snapshots": int(subset["snapshots"].sum()),
                 "sample_count": int(subset["sample_count"].sum()),
-                "mean_rank_ic": (
-                    float(subset["rank_ic_sum"].sum()) / rank_count
-                    if rank_count
-                    else np.nan
-                ),
-                "mean_spread": (
-                    float(subset["spread_sum"].sum()) / spread_count
-                    if spread_count
-                    else np.nan
-                ),
-                "positive_period_rate": (
-                    int(subset["positive_count"].sum()) / spread_count
-                    if spread_count
-                    else np.nan
-                ),
+                "mean_rank_ic": float(subset["rank_ic_sum"].sum()) / rank_count if rank_count else np.nan,
+                "mean_spread": float(subset["spread_sum"].sum()) / spread_count if spread_count else np.nan,
+                "positive_period_rate": int(subset["positive_count"].sum()) / spread_count if spread_count else np.nan,
             }
         )
     return pd.DataFrame(rows, columns=SUMMARY_COLUMNS)
 
 
-def _evaluate_file_to_shard(
-    path: Path,
-    shard_dir: str,
-    csv_dir: str | None,
-) -> dict:
+def _state_valid(state_path: Path, input_path: Path, metric_path: Path, csv_path: Path | None) -> dict | None:
+    payload = read_json(state_path)
+    if not payload:
+        return None
+    if payload.get("evaluation_contract_version") != EVAL_CONTRACT_VERSION:
+        return None
+    if payload.get("input_fingerprint") != file_fingerprint(input_path):
+        return None
+    rows = int(payload.get("rows", 0))
+    if rows > 0 and not metric_path.exists():
+        return None
+    if csv_path is not None and rows > 0 and not csv_path.exists():
+        return None
+    return payload
+
+
+def _evaluate_file_to_shard(path: Path, metric_dir: str, state_dir: str, csv_dir: str | None) -> dict:
+    token = _token(path)
+    metric_path = Path(metric_dir) / f"part-{token}.parquet"
+    state_path = Path(state_dir) / f"part-{token}.json"
+    csv_path = Path(csv_dir) / f"part-{token}.csv" if csv_dir else None
+    cached = _state_valid(state_path, path, metric_path, csv_path)
+    if cached is not None:
+        return {**cached, "status": "reused", "shard": str(metric_path), "csv": str(csv_path) if csv_path else None}
+
     date = ext(path, "date") or "unknown"
     kind = "edge" if "edge_spillover" in path.name else "node"
-    token = _shard_name(path)
-    shard_path = Path(shard_dir) / f"part-{token}.parquet"
-    csv_path = Path(csv_dir) / f"part-{token}.csv" if csv_dir else None
+    accumulator: dict = {}
+    csv_header = True
     if csv_path is not None:
         csv_path.parent.mkdir(parents=True, exist_ok=True)
         csv_path.unlink(missing_ok=True)
-
-    accumulator: dict = {}
-    csv_header = True
 
     def metric_frames():
         nonlocal csv_header
@@ -320,42 +276,39 @@ def _evaluate_file_to_shard(
                 continue
             _update_summary(accumulator, metrics)
             if csv_path is not None:
-                metrics.to_csv(
-                    csv_path,
-                    mode="a",
-                    header=csv_header,
-                    index=False,
-                )
+                metrics.to_csv(csv_path, mode="a", header=csv_header, index=False)
                 csv_header = False
             yield metrics
 
-    rows, batches = stream_frames(shard_path, metric_frames())
-    if not rows and csv_path is not None:
+    rows, batches = stream_frames(metric_path, metric_frames())
+    if rows == 0 and csv_path is not None:
         csv_path.unlink(missing_ok=True)
-    return {
+    payload = {
+        "evaluation_contract_version": EVAL_CONTRACT_VERSION,
         "input": str(path),
-        "shard": str(shard_path),
-        "csv": str(csv_path) if csv_path is not None and csv_path.exists() else None,
-        "rows": rows,
-        "batches": batches,
-        "status": "complete" if rows else "empty",
+        "input_fingerprint": file_fingerprint(path),
+        "rows": int(rows),
+        "batches": int(batches),
         "summary_records": _partial_summary_records(accumulator, date),
     }
+    write_json_atomic(state_path, payload)
+    return {**payload, "status": "complete" if rows else "empty", "shard": str(metric_path), "csv": str(csv_path) if csv_path else None}
 
 
-def _replace_directory(source: Path, destination: Path) -> None:
-    if destination.is_dir():
-        shutil.rmtree(destination)
-    elif destination.exists():
-        destination.unlink()
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    os.replace(source, destination)
+def _write_frame_atomic(frame: pd.DataFrame, path: Path, *, parquet: bool) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = Path(str(path) + ".tmp")
+    temporary.unlink(missing_ok=True)
+    if parquet:
+        frame.to_parquet(temporary, index=False)
+    else:
+        frame.to_csv(temporary, index=False)
+    os.replace(temporary, path)
 
 
 def _concatenate_csv_shards(paths: list[Path], destination: Path) -> None:
     temporary = Path(str(destination) + ".tmp")
     temporary.unlink(missing_ok=True)
-    destination.parent.mkdir(parents=True, exist_ok=True)
     with temporary.open("wb") as output:
         first = True
         for path in sorted(paths):
@@ -367,20 +320,18 @@ def _concatenate_csv_shards(paths: list[Path], destination: Path) -> None:
     os.replace(temporary, destination)
 
 
-def p0_eval_complete(output_dir: str | Path) -> bool:
+def p0_eval_complete(output_dir: str | Path, input_signature: str | None = None) -> bool:
     output_dir = Path(output_dir)
-    try:
-        payload = json.loads(
-            (output_dir / "manifest.json").read_text(encoding="utf-8")
-        )
-        return (
-            payload.get("status") == "complete"
-            and payload.get("evaluation_contract_version") == EVAL_CONTRACT_VERSION
-            and (output_dir / "p0_alpha_metrics.parquet").is_dir()
-            and (output_dir / "p0_alpha_summary.csv").exists()
-        )
-    except Exception:
-        return False
+    payload = read_json(output_dir / "manifest.json")
+    return bool(
+        payload
+        and payload.get("status") == "complete"
+        and payload.get("evaluation_contract_version") == EVAL_CONTRACT_VERSION
+        and (input_signature is None or payload.get("input_signature") == input_signature)
+        and (output_dir / "p0_alpha_metrics.parquet").is_dir()
+        and (output_dir / "p0_alpha_summary.csv").exists()
+        and (output_dir / "p0_alpha_summary_state.parquet").exists()
+    )
 
 
 def evaluate_p0_streaming(
@@ -391,19 +342,18 @@ def evaluate_p0_streaming(
     csv_mode: str = "none",
     skip_existing: bool = False,
 ) -> dict:
-    """Evaluate P0 partitions in parallel with exact pairwise-complete metrics.
-
-    The canonical metrics artifact is a partitioned Parquet dataset at
-    ``p0_alpha_metrics.parquet/``. Full CSV output is optional because serial
-    CSV serialization was the dominant wall-clock bottleneck.
-    """
     if csv_mode not in {"none", "sharded", "single"}:
-        raise ValueError("csv_mode must be one of: none, sharded, single")
-
+        raise ValueError("csv_mode must be none, sharded, or single")
     started = time.time()
+    files = list(Path(root).rglob("p0_node_features.parquet"))
+    files += list(Path(root).rglob("p0_edge_spillover_features.parquet"))
+    if month:
+        files = [path for path in files if f"date={month}" in str(path)]
+    files.sort(key=lambda path: path.stat().st_size, reverse=True)
+    signature = _input_signature(files)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    if skip_existing and p0_eval_complete(output_dir):
+    if skip_existing and p0_eval_complete(output_dir, signature):
         return {
             "stage": "p0_alpha_eval",
             "status": "skipped",
@@ -411,13 +361,6 @@ def evaluate_p0_streaming(
             "evaluation_contract_version": EVAL_CONTRACT_VERSION,
             "elapsed_sec": 0.0,
         }
-
-    files = list(Path(root).rglob("p0_node_features.parquet"))
-    files += list(Path(root).rglob("p0_edge_spillover_features.parquet"))
-    if month:
-        files = [path for path in files if f"date={month}" in str(path)]
-    files.sort(key=lambda path: path.stat().st_size, reverse=True)
-
     if not files:
         metadata = {
             "stage": "p0_alpha_eval",
@@ -425,92 +368,82 @@ def evaluate_p0_streaming(
             "input_files": 0,
             "output_rows": 0,
             "month": month,
+            "input_signature": signature,
             "evaluation_contract_version": EVAL_CONTRACT_VERSION,
         }
         write_manifest(output_dir, metadata)
         return metadata
 
-    work_root = output_dir / ".p0_eval_work"
-    shutil.rmtree(work_root, ignore_errors=True)
-    metric_work = work_root / "metrics"
-    csv_work = work_root / "csv"
-    metric_work.mkdir(parents=True, exist_ok=True)
+    metric_dir = output_dir / "p0_alpha_metrics.parquet"
+    state_dir = output_dir / ".p0_metric_state"
+    csv_dir = output_dir / "p0_alpha_metrics_csv"
+    metric_dir.mkdir(parents=True, exist_ok=True)
+    state_dir.mkdir(parents=True, exist_ok=True)
     csv_dir_arg = None
     if csv_mode in {"sharded", "single"}:
-        csv_work.mkdir(parents=True, exist_ok=True)
-        csv_dir_arg = str(csv_work)
+        csv_dir.mkdir(parents=True, exist_ok=True)
+        csv_dir_arg = str(csv_dir)
 
     worker_count = max(1, min(int(workers), len(files)))
-    try:
-        results = collect_process_map(
-            files,
-            worker_count,
-            _evaluate_file_to_shard,
-            str(metric_work),
-            csv_dir_arg,
-            max_in_flight=worker_count * 2,
-            max_tasks_per_child=None,
-        )
-        metric_rows = int(sum(result["rows"] for result in results))
-        metric_shards = [
-            Path(result["shard"])
-            for result in results
-            if result["status"] == "complete"
-            and Path(result["shard"]).exists()
-        ]
-        summary_records = [
-            record
-            for result in results
-            for record in result["summary_records"]
-        ]
-        summary = _finalize_summary(summary_records)
+    results = collect_process_map(
+        files,
+        worker_count,
+        _evaluate_file_to_shard,
+        str(metric_dir),
+        str(state_dir),
+        csv_dir_arg,
+        max_in_flight=worker_count * 2,
+        max_tasks_per_child=8,
+    )
 
-        final_metrics = output_dir / "p0_alpha_metrics.parquet"
-        _replace_directory(metric_work, final_metrics)
+    expected_tokens = {_token(path) for path in files}
+    for directory, suffix in ((metric_dir, ".parquet"), (state_dir, ".json")):
+        for path in directory.glob(f"part-*{suffix}"):
+            if path.stem.replace("part-", "") not in expected_tokens:
+                path.unlink(missing_ok=True)
+    if csv_dir.exists():
+        for path in csv_dir.glob("part-*.csv"):
+            if path.stem.replace("part-", "") not in expected_tokens:
+                path.unlink(missing_ok=True)
 
-        full_csv = output_dir / "p0_alpha_metrics.csv"
-        csv_dataset = output_dir / "p0_alpha_metrics_csv"
-        if csv_mode == "none":
-            full_csv.unlink(missing_ok=True)
-            shutil.rmtree(csv_dataset, ignore_errors=True)
-        elif csv_mode == "sharded":
-            full_csv.unlink(missing_ok=True)
-            _replace_directory(csv_work, csv_dataset)
-        else:
-            csv_paths = [
-                Path(result["csv"])
-                for result in results
-                if result.get("csv") and Path(result["csv"]).exists()
-            ]
-            _concatenate_csv_shards(csv_paths, full_csv)
-            shutil.rmtree(csv_dataset, ignore_errors=True)
+    metric_rows = int(sum(int(result.get("rows", 0)) for result in results))
+    summary_records = [record for result in results for record in result.get("summary_records", [])]
+    summary_state = pd.DataFrame.from_records(summary_records)
+    summary = _summary_frame(summary_state)
+    _write_frame_atomic(summary_state, output_dir / "p0_alpha_summary_state.parquet", parquet=True)
+    _write_frame_atomic(summary, output_dir / "p0_alpha_summary.csv", parquet=False)
 
-        summary_tmp = output_dir / "p0_alpha_summary.csv.tmp"
-        summary.to_csv(summary_tmp, index=False)
-        os.replace(summary_tmp, output_dir / "p0_alpha_summary.csv")
+    full_csv = output_dir / "p0_alpha_metrics.csv"
+    if csv_mode == "none":
+        full_csv.unlink(missing_ok=True)
+        shutil.rmtree(csv_dir, ignore_errors=True)
+    elif csv_mode == "sharded":
+        full_csv.unlink(missing_ok=True)
+    else:
+        csv_paths = [Path(result["csv"]) for result in results if result.get("csv") and Path(result["csv"]).exists()]
+        _concatenate_csv_shards(csv_paths, full_csv)
 
-        metadata = {
-            "stage": "p0_alpha_eval",
-            "status": "complete" if metric_rows else "empty",
-            "input_files": len(files),
-            "metric_rows": metric_rows,
-            "metric_shards": len(metric_shards),
-            "summary_rows": len(summary),
-            "output_rows": metric_rows,
-            "evaluation_scope": "per_decision_time_cross_section",
-            "evaluation_input_mode": "parallel_partition_metric_shards",
-            "evaluation_contract_version": EVAL_CONTRACT_VERSION,
-            "missing_data_semantics": "exact_pairwise_complete_by_validity_mask",
-            "metrics_layout": "partitioned_parquet_dataset",
-            "metrics_path": str(final_metrics),
-            "csv_mode": csv_mode,
-            "month": month,
-            "workers": worker_count,
-            "parallel_summary_reduction": True,
-            "serial_global_dataframe_concat": False,
-            "elapsed_sec": round(time.time() - started, 3),
-        }
-        write_manifest(output_dir, metadata)
-        return metadata
-    finally:
-        shutil.rmtree(work_root, ignore_errors=True)
+    metadata = {
+        "stage": "p0_alpha_eval",
+        "status": "complete" if metric_rows else "empty",
+        "evaluation_contract_version": EVAL_CONTRACT_VERSION,
+        "missing_data_semantics": "exact_pairwise_complete_by_validity_mask",
+        "input_files": len(files),
+        "input_signature": signature,
+        "metric_rows": metric_rows,
+        "metric_shards": sum(1 for path in metric_dir.glob("part-*.parquet")),
+        "reused_shards": sum(1 for result in results if result.get("status") == "reused"),
+        "summary_rows": len(summary),
+        "output_rows": metric_rows,
+        "evaluation_scope": "per_decision_time_cross_section",
+        "evaluation_input_mode": "resumable_parallel_partition_shards",
+        "metrics_layout": "partitioned_parquet_dataset",
+        "csv_mode": csv_mode,
+        "month": month,
+        "workers": worker_count,
+        "parallel_summary_reduction": True,
+        "serial_global_dataframe_concat": False,
+        "elapsed_sec": round(time.time() - started, 3),
+    }
+    write_manifest(output_dir, metadata)
+    return metadata
