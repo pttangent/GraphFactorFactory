@@ -112,6 +112,28 @@ def source_month_size_bytes(month: str) -> int:
     return total
 
 
+def file_fingerprint(path: Path) -> dict:
+    stat = path.stat()
+    return {"path": str(path.resolve()), "size_bytes": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+
+
+def label_status_path(month: str) -> Path:
+    return LOCAL_WORKSPACE / "label_injection_status" / f"month={month}.json"
+
+
+def month_labels_injected(month: str) -> bool:
+    try:
+        payload = json.loads(label_status_path(month).read_text(encoding="utf-8"))
+        if payload.get("daily_labels") != file_fingerprint(DAILY_LABELS_PATH):
+            return False
+        if payload.get("mapping") != file_fingerprint(MAPPING_PATH):
+            return False
+        dates = [path.name.split("=", 1)[1] for path in LOCAL_P0.glob(f"date={month}-*")]
+        return bool(dates) and all((LOCAL_P0 / f"date={date}" / "labels.parquet").exists() for date in dates)
+    except Exception:
+        return False
+
+
 def month_status_path(month: str) -> Path:
     return NAS_P2_OUT / "_month_status" / f"month={month}" / "_SUCCESS.json"
 
@@ -119,7 +141,13 @@ def month_status_path(month: str) -> Path:
 def month_is_complete(month: str) -> bool:
     try:
         payload = json.loads(month_status_path(month).read_text(encoding="utf-8"))
-        return payload.get("status") == "complete" and payload.get("month") == month
+        if payload.get("status") != "complete" or payload.get("month") != month:
+            return False
+        for item in payload.get("items", []):
+            expected = (int(item["files"]), int(item["bytes"]))
+            if directory_stats(Path(item["destination"])) != expected:
+                return False
+        return bool(payload.get("items"))
     except Exception:
         return False
 
@@ -136,14 +164,21 @@ def prefetch_month(month: str) -> None:
     LOCAL_P0.mkdir(parents=True, exist_ok=True)
     LOCAL_P1.mkdir(parents=True, exist_ok=True)
     for source in NAS_P0_ROOT.glob(f"date={month}-*"):
-        robocopy_dir(source, LOCAL_P0 / source.name)
+        destination = LOCAL_P0 / source.name
+        if not destination.exists():
+            robocopy_dir(source, destination)
     for source in NAS_P1_ROOT.glob(f"date={month}-*"):
-        robocopy_dir(source, LOCAL_P1 / source.name)
+        destination = LOCAL_P1 / source.name
+        if not destination.exists():
+            robocopy_dir(source, destination)
 
 
 def inject_month_labels(month: str) -> None:
     if not MAPPING_PATH.exists() or not DAILY_LABELS_PATH.exists():
         raise FileNotFoundError("stable mapping or PIT-safe daily labels missing")
+    if month_labels_injected(month):
+        print(f"[{time.strftime('%H:%M:%S')}] daily labels already injected for {month}; skipping", flush=True)
+        return
     print(f"[{time.strftime('%H:%M:%S')}] injecting daily labels for {month}", flush=True)
     report = inject_daily_labels(
         LOCAL_P0,
@@ -154,6 +189,25 @@ def inject_month_labels(month: str) -> None:
     )
     if report["updated_files"] == 0:
         raise RuntimeError(f"no daily labels injected for {month}")
+    status = label_status_path(month)
+    status.parent.mkdir(parents=True, exist_ok=True)
+    temporary = status.with_suffix(".json.tmp")
+    temporary.write_text(
+        json.dumps(
+            {
+                "status": "complete",
+                "month": month,
+                "daily_labels": file_fingerprint(DAILY_LABELS_PATH),
+                "mapping": file_fingerprint(MAPPING_PATH),
+                "report": report,
+            },
+            indent=2,
+            ensure_ascii=False,
+            default=str,
+        ),
+        encoding="utf-8",
+    )
+    os.replace(temporary, status)
     print(f"[{time.strftime('%H:%M:%S')}] injected next-open labels: {report}", flush=True)
 
 
@@ -224,6 +278,8 @@ def archive_month_outputs(month: str) -> None:
 
     copied: list[dict] = []
     for source, destination in pairs:
+        if destination.exists():
+            shutil.rmtree(destination)
         robocopy_dir(source, destination)
         source_stats = directory_stats(source)
         destination_stats = directory_stats(destination)
