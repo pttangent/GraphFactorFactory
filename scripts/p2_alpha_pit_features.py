@@ -8,6 +8,7 @@ from pathlib import Path
 
 from p2_parallel_runtime import collect_process_map
 from p2_pit_core import *
+from p2_streaming_io import stream_frames
 from p2_pit_theme import *
 from p2_pit_theme_streaming import build_theme_returns_one, relation_spillover_one
 from p2_pit_features import *
