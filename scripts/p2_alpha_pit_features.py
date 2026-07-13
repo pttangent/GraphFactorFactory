@@ -21,7 +21,7 @@ from p2_theme_date_runner import build_theme_returns_date, group_parts_by_date
 os.environ.setdefault("GFF_MIN_FREE_GB", "50")
 
 
-def pool(parts, workers: int, function, *args, tasks_per_child: int = 8):
+def pool(parts, workers: int, function, *args, tasks_per_child: int | None = None):
     if not parts:
         return []
     worker_count = max(1, min(int(workers), len(parts)))
