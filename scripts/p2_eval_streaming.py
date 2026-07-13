@@ -11,7 +11,7 @@ import numpy as np
 import pandas as pd
 
 from p2_parallel_runtime import collect_process_map
-from p2_pit_core import ext, iter_time_groups, read_partition, stream_frames, write_manifest, write_parquet_atomic
+from p2_pit_core import ext, iter_partition_batches, iter_time_groups, read_partition, stream_frames, write_manifest
 from p2_pit_features import evaluate_daily_frame, evaluate_intraday_frame
 
 
@@ -22,21 +22,21 @@ def _shard_name(path: Path) -> str:
 
 def _evaluate_file_to_shard(path: Path, mode: str, shard_dir: str) -> dict:
     shard_path = Path(shard_dir) / _shard_name(path)
-    frames: list[pd.DataFrame] = []
-    if mode == "intraday":
-        for _, snapshot in iter_time_groups(path):
-            metrics = evaluate_intraday_frame(snapshot)
+
+    def metric_frames():
+        if mode == "intraday":
+            for _, snapshot in iter_time_groups(path):
+                metrics = evaluate_intraday_frame(snapshot)
+                if not metrics.empty:
+                    yield metrics
+        else:
+            frame = read_partition(path)
+            metrics = evaluate_daily_frame(frame) if not frame.empty else pd.DataFrame()
             if not metrics.empty:
-                frames.append(metrics)
-    else:
-        frame = read_partition(path)
-        metrics = evaluate_daily_frame(frame) if not frame.empty else pd.DataFrame()
-        if not metrics.empty:
-            frames.append(metrics)
-    output = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
-    if not output.empty:
-        write_parquet_atomic(output, shard_path)
-    return {"input": str(path), "shard": str(shard_path), "rows": len(output), "status": "complete" if len(output) else "empty"}
+                yield metrics
+
+    rows, batches = stream_frames(shard_path, metric_frames())
+    return {"input": str(path), "shard": str(shard_path), "rows": rows, "batches": batches, "status": "complete" if rows else "empty"}
 
 
 def _discover_feature_files(
@@ -64,11 +64,10 @@ def _update_summary(accumulator: dict, metrics: pd.DataFrame, mode: str) -> None
     if metrics.empty:
         return
     keys = ["score", "target", "layer_id", "scale", "level"]
-    grouped = metrics.groupby(keys, sort=False, dropna=False)
-    for group_key, subset in grouped:
+    for group_key, subset in metrics.groupby(keys, sort=False, dropna=False):
         state = accumulator.setdefault(group_key, {
-            "days": 0,
-            "snapshots": 0,
+            "dates": set(),
+            "snapshots": set(),
             "sample_count": 0,
             "rank_ic_sum": 0.0,
             "rank_ic_count": 0,
@@ -76,8 +75,11 @@ def _update_summary(accumulator: dict, metrics: pd.DataFrame, mode: str) -> None
             "spread_count": 0,
             "positive_count": 0,
         })
-        state["days"] += int(subset["date"].nunique())
-        state["snapshots"] += int(subset["decision_time"].nunique()) if mode == "intraday" else int(subset["date"].nunique())
+        state["dates"].update(subset["date"].dropna().astype(str).tolist())
+        if mode == "intraday" and "decision_time" in subset:
+            state["snapshots"].update(pd.to_datetime(subset["decision_time"], utc=True, errors="coerce").dropna().astype(str).tolist())
+        else:
+            state["snapshots"].update(subset["date"].dropna().astype(str).tolist())
         state["sample_count"] += int(subset["sample_count"].sum())
         rank = pd.to_numeric(subset["rank_ic"], errors="coerce")
         spread = pd.to_numeric(subset["top_minus_bottom"], errors="coerce")
@@ -98,8 +100,8 @@ def _summary_frame(accumulator: dict) -> pd.DataFrame:
             "layer_id": layer_id,
             "scale": scale,
             "level": level,
-            "days": state["days"],
-            "snapshots": state["snapshots"],
+            "days": len(state["dates"]),
+            "snapshots": len(state["snapshots"]),
             "sample_count": state["sample_count"],
             "mean_rank_ic": state["rank_ic_sum"] / state["rank_ic_count"] if state["rank_ic_count"] else np.nan,
             "mean_spread": state["spread_sum"] / state["spread_count"] if state["spread_count"] else np.nan,
@@ -145,13 +147,13 @@ def evaluate_feature_root(
     def metric_frames():
         nonlocal header
         for shard in sorted(shard_paths):
-            metrics = pd.read_parquet(shard)
-            if metrics.empty:
-                continue
-            _update_summary(accumulator, metrics, mode)
-            metrics.to_csv(metrics_csv, mode="a", header=header, index=False)
-            header = False
-            yield metrics
+            for metrics in iter_partition_batches(shard, batch_size=100_000):
+                if metrics.empty:
+                    continue
+                _update_summary(accumulator, metrics, mode)
+                metrics.to_csv(metrics_csv, mode="a", header=header, index=False)
+                header = False
+                yield metrics
 
     metric_rows, _ = stream_frames(metrics_parquet, metric_frames())
     if header:
@@ -169,7 +171,7 @@ def evaluate_feature_root(
         "summary_rows": len(summary),
         "output_rows": metric_rows,
         "evaluation_scope": "per_decision_time_cross_section" if mode == "intraday" else "per_date_eod_cross_section",
-        "evaluation_input_mode": "partition_shards_no_global_concat",
+        "evaluation_input_mode": "partition_shards_streamed_reducer",
         "workers": worker_count,
         "dates_filter": sorted(dates) if dates else None,
         "metrics_csv": str(metrics_csv),
