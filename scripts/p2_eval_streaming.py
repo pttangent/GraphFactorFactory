@@ -13,9 +13,9 @@ import numpy as np
 import pandas as pd
 
 from p2_checkpoint import file_fingerprint, read_json, write_json_atomic
+from p2_exact_eval import evaluate_daily_frame_exact, evaluate_intraday_frame_exact
 from p2_parallel_runtime import collect_process_map
 from p2_pit_core import ext, iter_time_groups, read_partition, write_manifest
-from p2_pit_features import evaluate_daily_frame, evaluate_intraday_frame
 from p2_streaming_io import stream_frames
 
 EVAL_CONTRACT_VERSION = "p2-eval-resumable-partitioned-v3"
@@ -29,6 +29,17 @@ SUMMARY_COLUMNS = [
     "mean_spread",
     "positive_period_rate",
 ]
+SUMMARY_STATE_COLUMNS = [
+    "date",
+    *SUMMARY_KEYS,
+    "snapshots",
+    "sample_count",
+    "rank_ic_sum",
+    "rank_ic_count",
+    "spread_sum",
+    "spread_count",
+    "positive_count",
+]
 
 
 def _token(path: Path) -> str:
@@ -38,8 +49,7 @@ def _token(path: Path) -> str:
 def _input_signature(files: list[Path]) -> str:
     digest = hashlib.sha256()
     for path in sorted(files, key=lambda value: str(value.resolve())):
-        fingerprint = file_fingerprint(path)
-        digest.update(json.dumps(fingerprint, sort_keys=True).encode("utf-8"))
+        digest.update(json.dumps(file_fingerprint(path), sort_keys=True).encode("utf-8"))
     return digest.hexdigest()
 
 
@@ -100,12 +110,12 @@ def _partial_summary_records(accumulator: dict, date: str) -> list[dict]:
         score, target, layer_id, scale, level = key
         records.append(
             {
-                "date": date,
-                "score": score,
-                "target": target,
-                "layer_id": layer_id,
-                "scale": scale,
-                "level": level,
+                "date": str(date),
+                "score": str(score),
+                "target": str(target),
+                "layer_id": str(layer_id),
+                "scale": str(scale),
+                "level": str(level),
                 "snapshots": len(state["snapshots"]),
                 "sample_count": int(state["sample_count"]),
                 "rank_ic_sum": float(state["rank_ic_sum"]),
@@ -119,7 +129,7 @@ def _partial_summary_records(accumulator: dict, date: str) -> list[dict]:
 
 
 def _summary_frame(records: list[dict] | pd.DataFrame) -> pd.DataFrame:
-    partial = records if isinstance(records, pd.DataFrame) else pd.DataFrame.from_records(records)
+    partial = records if isinstance(records, pd.DataFrame) else pd.DataFrame.from_records(records, columns=SUMMARY_STATE_COLUMNS)
     if partial.empty:
         return pd.DataFrame(columns=SUMMARY_COLUMNS)
     rows: list[dict] = []
@@ -156,6 +166,8 @@ def _state_valid(state_path: Path, input_path: Path, mode: str, metric_path: Pat
     rows = int(payload.get("rows", 0))
     if rows > 0 and not metric_path.exists():
         return None
+    if rows == 0 and metric_path.exists():
+        return None
     if csv_path is not None and rows > 0 and not csv_path.exists():
         return None
     return payload
@@ -191,7 +203,7 @@ def _evaluate_file_to_shard(
             frame = read_partition(path)
             source_frames = iter([frame]) if not frame.empty else iter([])
         for source in source_frames:
-            metrics = evaluate_intraday_frame(source) if mode == "intraday" else evaluate_daily_frame(source)
+            metrics = evaluate_intraday_frame_exact(source) if mode == "intraday" else evaluate_daily_frame_exact(source)
             if metrics.empty:
                 continue
             _update_summary(accumulator, metrics, mode)
@@ -288,6 +300,11 @@ def evaluate_feature_root(
         }
 
     if not files:
+        shutil.rmtree(output_dir / f"{mode}_alpha_metrics.parquet", ignore_errors=True)
+        shutil.rmtree(output_dir / f".{mode}_metric_state", ignore_errors=True)
+        shutil.rmtree(output_dir / f"{mode}_alpha_metrics_csv", ignore_errors=True)
+        for name in (f"{mode}_alpha_metrics.csv", f"{mode}_alpha_summary.csv", f"{mode}_alpha_summary_state.parquet"):
+            (output_dir / name).unlink(missing_ok=True)
         metadata = {
             "stage": f"{mode}_feature_eval",
             "status": "empty",
@@ -320,7 +337,7 @@ def evaluate_feature_root(
         str(state_dir),
         csv_dir_arg,
         max_in_flight=worker_count * 2,
-        max_tasks_per_child=None,
+        max_tasks_per_child=8,
     )
 
     expected_tokens = {_token(path) for path in files}
@@ -335,7 +352,7 @@ def evaluate_feature_root(
 
     metric_rows = int(sum(int(result.get("rows", 0)) for result in results))
     summary_records = [record for result in results for record in result.get("summary_records", [])]
-    summary_state = pd.DataFrame.from_records(summary_records)
+    summary_state = pd.DataFrame.from_records(summary_records, columns=SUMMARY_STATE_COLUMNS)
     summary = _summary_frame(summary_state)
     state_path = output_dir / f"{mode}_alpha_summary_state.parquet"
     summary_path = output_dir / f"{mode}_alpha_summary.csv"
@@ -357,6 +374,7 @@ def evaluate_feature_root(
         "status": "complete" if metric_rows else "empty",
         "mode": mode,
         "evaluation_contract_version": EVAL_CONTRACT_VERSION,
+        "missing_data_semantics": "exact_pairwise_complete_by_validity_mask",
         "input_count": len(files),
         "input_signature": signature,
         "metric_rows": metric_rows,
@@ -404,7 +422,8 @@ def merge_evaluation_states(
         return metadata
 
     states = [pd.read_parquet(path) for path in files]
-    combined = pd.concat(states, ignore_index=True) if states else pd.DataFrame()
+    combined = pd.concat(states, ignore_index=True) if states else pd.DataFrame(columns=SUMMARY_STATE_COLUMNS)
+    combined = combined.reindex(columns=SUMMARY_STATE_COLUMNS)
     summary = _summary_frame(combined)
     _write_frame_atomic(combined, output_dir / filename, parquet=True)
     _write_frame_atomic(summary, output_dir / f"{mode}_alpha_summary.csv", parquet=False)
