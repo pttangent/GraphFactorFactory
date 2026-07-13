@@ -27,9 +27,9 @@ def test_24core_128gb_plan_uses_nested_threads_without_oom_process_count():
     relation = plan["relation-spillover"]
 
     assert (theme.workers, theme.inner_workers, theme.estimated_slots) == (6, 4, 24)
-    assert (relation.workers, relation.inner_workers, relation.estimated_slots) == (8, 3, 24)
+    assert (relation.workers, relation.inner_workers, relation.estimated_slots) == (6, 4, 24)
     assert max(stage.workers for stage in plan.values()) <= 24
-    assert all(stage.estimated_peak_ram_gb <= 104.0 for stage in plan.values())
+    assert all(stage.estimated_peak_ram_gb <= 93.6 for stage in plan.values())
 
 
 def test_safe_profile_leaves_more_ram_than_balanced():
