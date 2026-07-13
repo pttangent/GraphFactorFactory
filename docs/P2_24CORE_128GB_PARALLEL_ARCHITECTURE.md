@@ -7,6 +7,7 @@ The workstation is treated as a single global resource domain:
 - 24 CPU cores
 - 128GB physical RAM
 - 24GB reserved for Windows, filesystem cache and transient Arrow/Pandas peaks
+- only 90% of the remaining 104GB is schedulable (93.6GB hard planning budget)
 - at most one heavy pipeline stage active at a time
 - every heavy Python process handles one partition and then exits
 
@@ -14,14 +15,14 @@ The workstation is treated as a single global resource domain:
 
 | Stage | Outer processes | Threads per process | CPU slots | Estimated peak RAM |
 |---|---:|---:|---:|---:|
-| P0 node | 23 | 1 | 23 | 103.5GB |
-| P0 edge spillover | 18 | 1 | 18 | 99GB |
+| P0 node | 20 | 1 | 20 | 90GB |
+| P0 edge spillover | 17 | 1 | 17 | 93.5GB |
 | P0 graph state | 24 | 1 | 24 | 48GB |
-| P0 evaluation | 17 | 1 | 17 | 102GB |
+| P0 evaluation | 15 | 1 | 15 | 90GB |
 | Theme returns | 6 | 4 | 24 | 84GB |
-| Relation spillover | 8 | 3 | 24 | 96GB |
-| Intraday relation features | 20 | 1 | 20 | 100GB |
-| Daily relation features | 14 | 1 | 14 | 98GB |
+| Relation spillover | 6 | 4 | 24 | 72GB |
+| Intraday relation features | 18 | 1 | 18 | 90GB |
+| Daily relation features | 13 | 1 | 13 | 91GB |
 
 The scheduler writes the resolved plan to `p2_24core_schedule_plan.json` before execution.
 
@@ -51,4 +52,4 @@ python scripts\run_p2_24core_scheduler.py ^
   --skip-existing
 ```
 
-`--inner-workers 0` lets the scheduler choose 6×4 for theme returns and 8×3 for relation spillover. Do not restore 32-process label injection or `--cores 28` on this machine.
+`--inner-workers 0` lets the scheduler choose 6×4 for both theme returns and relation spillover. Do not restore 32-process label injection or `--cores 28` on this machine.
