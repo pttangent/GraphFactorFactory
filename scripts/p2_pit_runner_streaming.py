@@ -9,16 +9,13 @@ from pathlib import Path
 
 import pandas as pd
 
-from p2_pit_core import (
-    Part,
-    is_complete,
-    iter_time_groups,
-    read_partition,
-    stream_frames,
-    write_manifest,
-    write_parquet_atomic,
-)
+from p2_checkpoint import file_fingerprint, stage_checkpoint_valid
+from p2_pit_core import Part, iter_time_groups, read_partition, write_manifest, write_parquet_atomic
 from p2_pit_features import build_daily_feature_frame, build_intraday_feature_frame
+from p2_streaming_io import stream_frames
+
+INTRADAY_FEATURE_CONTRACT = "intraday-relation-features-v3"
+DAILY_FEATURE_CONTRACT = "daily-relation-features-v3"
 
 
 def _checked_intraday_frames(
@@ -36,17 +33,29 @@ def _checked_intraday_frames(
         yield output
 
 
+def _temporal_paths(temporal_root: str | Path, part: Part) -> tuple[Path, Path]:
+    partition_dir = Path(temporal_root) / f"date={part.date}" / f"layer_id={part.layer_id}" / f"scale={part.scale}"
+    return partition_dir / "temporal_theme_edges.parquet", partition_dir / "manifest.json"
+
+
+def _temporal_fingerprint(temporal_root: str | Path, part: Part) -> dict:
+    temporal_path, manifest_path = _temporal_paths(temporal_root, part)
+    if temporal_path.exists():
+        return {"mode": "file", "fingerprint": file_fingerprint(temporal_path)}
+    if manifest_path.exists():
+        return {"mode": "zero-edge-manifest", "fingerprint": file_fingerprint(manifest_path)}
+    return {"mode": "missing", "fingerprint": None}
+
+
 def _load_temporal_edges(
     temporal_root: str | Path,
     part: Part,
     max_row_groups: int | None,
 ) -> tuple[pd.DataFrame, str]:
-    partition_dir = Path(temporal_root) / f"date={part.date}" / f"layer_id={part.layer_id}" / f"scale={part.scale}"
-    temporal_path = partition_dir / "temporal_theme_edges.parquet"
+    temporal_path, manifest_path = _temporal_paths(temporal_root, part)
     if temporal_path.exists():
         return read_partition(temporal_path, None, max_row_groups), "p1_temporal_edges"
 
-    manifest_path = partition_dir / "manifest.json"
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     except Exception as error:
@@ -72,7 +81,27 @@ def build_feature_one(
     output_dir = Path(output_root) / f"date={part.date}" / f"layer_id={part.layer_id}" / f"scale={part.scale}"
     filename = "intraday_relation_features.parquet" if mode == "intraday" else "daily_relation_features.parquet"
     output_path = output_dir / filename
-    if skip_existing and is_complete(output_dir / "manifest.json") and output_path.exists():
+    contract = INTRADAY_FEATURE_CONTRACT if mode == "intraday" else DAILY_FEATURE_CONTRACT
+
+    inputs = {"signals": file_fingerprint(part.base)}
+    if mode == "daily":
+        if temporal_root is None:
+            raise ValueError("daily mode requires --p1-root with temporal_theme_edges.parquet")
+        inputs["temporal_identity"] = _temporal_fingerprint(temporal_root, part)
+    config = {
+        "mode": mode,
+        "underreaction_past_horizon": underreaction_past_horizon,
+        "late_minutes": late_minutes if mode == "daily" else None,
+        "max_row_groups": max_row_groups,
+    }
+    if skip_existing and stage_checkpoint_valid(
+        output_dir / "manifest.json",
+        stage=f"{mode}_relation_features",
+        contract_version=contract,
+        inputs=inputs,
+        config=config,
+        output_path=output_path,
+    ):
         return {"stage": f"{mode}_relation_features", "status": "skipped", "date": part.date, "layer_id": part.layer_id, "scale": part.scale}
 
     output_rows = write_batches = 0
@@ -87,8 +116,6 @@ def build_feature_one(
     else:
         source = read_partition(part.base, None, max_row_groups)
         if not source.empty:
-            if temporal_root is None:
-                raise ValueError("daily mode requires --p1-root with temporal_theme_edges.parquet")
             temporal, temporal_identity = _load_temporal_edges(temporal_root, part, max_row_groups)
             if "level" in temporal and not temporal.empty:
                 temporal = temporal[temporal["level"].astype(str).isin(source["level"].astype(str).unique())]
@@ -100,9 +127,12 @@ def build_feature_one(
                 write_parquet_atomic(output, output_path)
                 output_rows = len(output)
                 write_batches = 1
+        if output_rows == 0:
+            output_path.unlink(missing_ok=True)
 
     metadata = {
         "stage": f"{mode}_relation_features",
+        "stage_contract_version": contract,
         "status": "complete" if output_rows else "empty",
         "date": part.date,
         "layer_id": part.layer_id,
@@ -115,6 +145,8 @@ def build_feature_one(
         "normalization_scope": "snapshot_cross_section" if mode == "intraday" else "eod_cross_section",
         "temporal_identity": temporal_identity,
         "input_mode": input_mode,
+        "inputs": inputs,
+        "config": config,
         "output": str(output_path),
         "elapsed_sec": round(time.time() - started, 3),
     }
