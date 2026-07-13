@@ -79,11 +79,13 @@ def _stream_merge_label_file(
     except BaseException:
         if writer is not None:
             writer.close()
+        parquet.close()
         temporary.unlink(missing_ok=True)
         raise
     else:
         if writer is not None:
             writer.close()
+        parquet.close()
         if rows:
             os.replace(temporary, label_path)
         else:
