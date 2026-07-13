@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
-"""Resource-aware scheduler for the PIT-safe P2 pipeline."""
+"""RAM-aware scheduler for the PIT-safe P2 pipeline."""
 from __future__ import annotations
 
 import argparse
 import json
 import math
 import os
-import subprocess
 import sys
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from p2_alpha_pit_features import DEFAULT_HORIZONS, DEFAULT_INTRADAY_HORIZONS, PIT_CONTRACT_VERSION
+from p2_parallel_runtime import run_process_tree
 
 THREAD_CAPS = {
     "OMP_NUM_THREADS": "1",
@@ -22,6 +22,24 @@ THREAD_CAPS = {
     "ARROW_NUM_THREADS": "1",
     "POLARS_MAX_THREADS": "1",
     "PYTHONUNBUFFERED": "1",
+    "GFF_MAX_TASKS_PER_CHILD": "1",
+}
+
+BASE_GB_PER_PROCESS = {
+    "p0-node-features": 4.5,
+    "p0-edge-spillover": 5.5,
+    "p0-graph-state": 2.0,
+    "p0-eval": 6.0,
+    "build-theme-returns": 14.0,
+    "relation-spillover": 12.0,
+    "intraday-relation-features": 5.0,
+    "daily-relation-features": 7.0,
+}
+PROFILE_MEMORY_MULTIPLIER = {
+    "safe": 1.25,
+    "balanced": 1.0,
+    "aggressive": 0.90,
+    "max": 0.85,
 }
 
 
@@ -31,6 +49,8 @@ class StagePlan:
     workers: int
     inner_workers: int
     estimated_slots: int
+    memory_gb_per_worker: float
+    estimated_peak_ram_gb: float
     reason: str
 
 
@@ -38,25 +58,77 @@ def csv_arg(name: str, value: str | None) -> list[str]:
     return [name, value] if value else []
 
 
-def build_plan(cores: int, target_cpu: float, profile: str, inner_workers: int) -> dict[str, StagePlan]:
-    target = max(1, int(math.ceil(cores * target_cpu)))
-    inner_workers = max(1, inner_workers)
-    if profile == "safe":
-        p0, nested, feature = min(target, 12), max(1, min(4, target // inner_workers)), min(target, 16)
-    elif profile == "balanced":
-        p0, nested, feature = min(target, 18), max(1, min(8, math.ceil(target / inner_workers))), min(target, 20)
-    elif profile == "aggressive":
-        p0, nested, feature = min(cores, 22), max(1, min(12, math.ceil(cores / inner_workers))), min(cores, 24)
-    else:
-        p0, nested, feature = cores, max(1, math.ceil(cores / inner_workers)), cores
+def _worker_cap(usable_ram_gb: float, gb_per_worker: float, target: int) -> int:
+    return max(1, min(target, int(usable_ram_gb // gb_per_worker)))
+
+
+def _nested_shape(target: int, outer_cap: int, requested_inner: int, inner_cap: int = 4) -> tuple[int, int]:
+    if requested_inner > 0:
+        inner = min(inner_cap, requested_inner)
+        outer = max(1, min(outer_cap, math.ceil(target / inner)))
+        return outer, inner
+    best = (1, 1, 1)
+    for inner in range(1, inner_cap + 1):
+        outer = max(1, min(outer_cap, target // inner))
+        slots = outer * inner
+        candidate = (slots, outer, inner)
+        if slots <= target and candidate > best:
+            best = candidate
+    return best[1], best[2]
+
+
+def build_plan(
+    cores: int,
+    target_cpu: float,
+    profile: str,
+    inner_workers: int,
+    ram_gb: float = 128.0,
+    reserve_ram_gb: float = 24.0,
+) -> dict[str, StagePlan]:
+    target = max(1, min(int(cores), int(math.ceil(cores * target_cpu))))
+    usable_ram = max(8.0, float(ram_gb) - float(reserve_ram_gb))
+    multiplier = PROFILE_MEMORY_MULTIPLIER[profile]
+
+    def memory(stage: str) -> float:
+        return BASE_GB_PER_PROCESS[stage] * multiplier
+
+    def simple(stage: str, reason: str) -> StagePlan:
+        per_worker = memory(stage)
+        workers = _worker_cap(usable_ram, per_worker, target)
+        return StagePlan(stage, workers, 1, workers, per_worker, workers * per_worker, reason)
+
+    theme_memory = memory("build-theme-returns")
+    theme_cap = _worker_cap(usable_ram, theme_memory, target)
+    theme_outer, theme_inner = _nested_shape(target, theme_cap, inner_workers)
+    relation_memory = memory("relation-spillover")
+    relation_cap = _worker_cap(usable_ram, relation_memory, target)
+    relation_outer, relation_inner = _nested_shape(target, relation_cap, inner_workers)
+
     return {
-        "p0-node-features": StagePlan("p0-node-features", p0, 1, p0, "snapshot-local P0 node features"),
-        "p0-edge-spillover": StagePlan("p0-edge-spillover", p0, 1, p0, "PIT-aligned P0 edge spillover"),
-        "p0-graph-state": StagePlan("p0-graph-state", p0, 1, p0, "snapshot graph state"),
-        "build-theme-returns": StagePlan("build-theme-returns", nested, inner_workers, nested * inner_workers, "actual label-exit-time alignment"),
-        "relation-spillover": StagePlan("relation-spillover", nested, inner_workers, nested * inner_workers, "symmetric neighbor diffusion"),
-        "intraday-relation-features": StagePlan("intraday-relation-features", feature, 1, feature, "snapshot-local normalization"),
-        "daily-relation-features": StagePlan("daily-relation-features", feature, 1, feature, "EOD aggregation for next-open labels"),
+        "p0-node-features": simple("p0-node-features", "row-group streamed P0 nodes; RAM-capped outer processes"),
+        "p0-edge-spillover": simple("p0-edge-spillover", "row-group streamed P0 spillover; RAM-capped outer processes"),
+        "p0-graph-state": simple("p0-graph-state", "light row-group graph-state stage"),
+        "p0-eval": simple("p0-eval", "monthly P0 evaluation"),
+        "build-theme-returns": StagePlan(
+            "build-theme-returns",
+            theme_outer,
+            theme_inner,
+            theme_outer * theme_inner,
+            theme_memory,
+            theme_outer * theme_memory,
+            "RAM-limited outer processes plus bounded snapshot threads",
+        ),
+        "relation-spillover": StagePlan(
+            "relation-spillover",
+            relation_outer,
+            relation_inner,
+            relation_outer * relation_inner,
+            relation_memory,
+            relation_outer * relation_memory,
+            "RAM-limited outer processes; symmetric expansion is snapshot-local",
+        ),
+        "intraday-relation-features": simple("intraday-relation-features", "snapshot-local normalization"),
+        "daily-relation-features": simple("daily-relation-features", "EOD temporal-episode aggregation"),
     }
 
 
@@ -64,9 +136,9 @@ def run_command(command: list[str], environment: dict[str, str], dry_run: bool) 
     print("\n$ " + " ".join(map(str, command)), flush=True)
     if dry_run:
         return
-    completed = subprocess.run(command, env=environment)
-    if completed.returncode != 0:
-        raise SystemExit(completed.returncode)
+    return_code = run_process_tree(command, env=environment)
+    if return_code != 0:
+        raise SystemExit(return_code)
 
 
 def common_filters(args: argparse.Namespace) -> list[str]:
@@ -84,7 +156,7 @@ def p0_filters(args: argparse.Namespace) -> list[str]:
     output: list[str] = []
     for name, value in (("--dates", args.dates), ("--layers", args.layers), ("--scales", args.scales)):
         output += csv_arg(name, value)
-    intraday = [h for h in args.horizons.split(",") if h.endswith("m")]
+    intraday = [horizon for horizon in args.horizons.split(",") if horizon.endswith("m")]
     output += ["--horizons", ",".join(intraday or DEFAULT_INTRADAY_HORIZONS)]
     if args.max_row_groups is not None:
         output += ["--max-row-groups", str(args.max_row_groups)]
@@ -94,7 +166,7 @@ def p0_filters(args: argparse.Namespace) -> list[str]:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="PIT-safe full P2 alpha scheduler")
+    parser = argparse.ArgumentParser(description="PIT-safe 24-core / 128GB alpha scheduler")
     parser.add_argument("--p0-root")
     parser.add_argument("--p1-root")
     parser.add_argument("--labels-root", required=True)
@@ -112,8 +184,10 @@ def main() -> None:
     parser.add_argument("--tiers")
     parser.add_argument("--cores", type=int, default=24)
     parser.add_argument("--target-cpu", type=float, default=1.0)
-    parser.add_argument("--inner-workers", type=int, default=1)
-    parser.add_argument("--profile", choices=["safe", "balanced", "aggressive", "max"], default="max")
+    parser.add_argument("--inner-workers", type=int, default=0, help="0=auto; threads inside each heavy outer process")
+    parser.add_argument("--ram-gb", type=float, default=128.0)
+    parser.add_argument("--reserve-ram-gb", type=float, default=24.0)
+    parser.add_argument("--profile", choices=["safe", "balanced", "aggressive", "max"], default="balanced")
     parser.add_argument(
         "--stage",
         choices=["all", "p0", "p0-node", "p0-edge", "p0-graph", "p0-eval", "theme", "relation", "intraday", "daily", "intraday-eval", "daily-eval", "eval"],
@@ -124,20 +198,26 @@ def main() -> None:
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
-    if not (0 < args.target_cpu <= 1.5):
-        raise SystemExit("--target-cpu must be in (0, 1.5]")
-    if args.inner_workers < 1:
-        raise SystemExit("--inner-workers must be >=1")
+    if not (0 < args.target_cpu <= 1.0):
+        raise SystemExit("--target-cpu must be in (0, 1.0]")
+    if args.inner_workers < 0:
+        raise SystemExit("--inner-workers must be >=0")
+    if args.ram_gb <= args.reserve_ram_gb:
+        raise SystemExit("--ram-gb must exceed --reserve-ram-gb")
 
     root = Path(args.p2_root)
     root.mkdir(parents=True, exist_ok=True)
-    plan = build_plan(args.cores, args.target_cpu, args.profile, args.inner_workers)
+    plan = build_plan(args.cores, args.target_cpu, args.profile, args.inner_workers, args.ram_gb, args.reserve_ram_gb)
     payload = {
         "pit_contract_version": PIT_CONTRACT_VERSION,
         "profile": args.profile,
         "cores": args.cores,
         "target_cpu": args.target_cpu,
-        "inner_workers": args.inner_workers,
+        "ram_gb": args.ram_gb,
+        "reserve_ram_gb": args.reserve_ram_gb,
+        "usable_ram_gb": args.ram_gb - args.reserve_ram_gb,
+        "worker_recycling": "one_partition_per_process",
+        "maximum_outer_python_workers": max(stage.workers for stage in plan.values()),
         "stage_plan": {key: asdict(value) for key, value in plan.items()},
         "filters": {
             "dates": args.dates,
@@ -179,7 +259,8 @@ def main() -> None:
         if args.skip_existing and (root / eval_dir / "p0_alpha_metrics.csv").exists():
             print(f"Skipping existing P0 eval at {root / eval_dir}", flush=True)
         else:
-            run_command([python, args.p0_script, "eval-p0", "--p0-alpha-root", str(root), "--out-dir", str(root / eval_dir), "--month", month], environment, args.dry_run)
+            stage = plan["p0-eval"]
+            run_command([python, args.p0_script, "eval-p0", "--p0-alpha-root", str(root), "--out-dir", str(root / eval_dir), "--month", month, "--workers", str(stage.workers)], environment, args.dry_run)
 
     if args.stage in {"all", "theme"}:
         if not args.p1_root:
