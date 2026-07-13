@@ -8,6 +8,7 @@ import multiprocessing as mp
 import os
 import signal
 import subprocess
+from collections import deque
 from collections.abc import Iterable, Iterator
 from typing import Any, Callable, TypeVar
 
@@ -30,7 +31,7 @@ def bounded_thread_map(
     *,
     max_in_flight: int | None = None,
 ) -> Iterator[R]:
-    """Yield thread results while retaining only a bounded number of inputs."""
+    """Yield completed thread results with bounded retained inputs."""
     workers = max(1, int(workers))
     limit = max(workers, int(max_in_flight or workers * 2))
     iterator = iter(items)
@@ -55,6 +56,51 @@ def bounded_thread_map(
                 result = future.result()
                 submit_one()
                 yield result
+    except BaseException:
+        for future in pending:
+            future.cancel()
+        executor.shutdown(wait=True, cancel_futures=True)
+        raise
+    else:
+        executor.shutdown(wait=True, cancel_futures=False)
+
+
+def bounded_thread_map_ordered(
+    items: Iterable[T],
+    workers: int,
+    function: Callable[[T], R],
+    *,
+    max_in_flight: int | None = None,
+) -> Iterator[R]:
+    """Yield bounded thread results in input order.
+
+    This is required for parquet stages whose downstream consumers merge sorted
+    ``decision_time`` streams. Parallel work remains bounded, while output order
+    is deterministic even when later snapshots finish first.
+    """
+    workers = max(1, int(workers))
+    limit = max(workers, int(max_in_flight or workers * 2))
+    iterator = iter(items)
+    executor = cf.ThreadPoolExecutor(max_workers=workers)
+    pending: deque[cf.Future[R]] = deque()
+
+    def submit_one() -> bool:
+        try:
+            item = next(iterator)
+        except StopIteration:
+            return False
+        pending.append(executor.submit(function, item))
+        return True
+
+    try:
+        for _ in range(limit):
+            if not submit_one():
+                break
+        while pending:
+            future = pending.popleft()
+            result = future.result()
+            submit_one()
+            yield result
     except BaseException:
         for future in pending:
             future.cancel()
