@@ -6,6 +6,7 @@ import argparse
 import json
 
 from p2_alpha_pit_features import DEFAULT_INTRADAY_HORIZONS, PIT_CONTRACT_VERSION, csvlist, csvset
+from p2_eval_layout import prepare_eval_output
 from p2_parallel_runtime import collect_process_map
 from p2_p0_canonical_direct import STAGE_LAYOUT, run_direct
 from p2_p0_eval_streaming import evaluate_p0_streaming
@@ -72,6 +73,7 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.command == "eval-p0":
+        prepare_eval_output(args.out_dir, "p0", args.csv_mode)
         result = evaluate_p0_streaming(
             args.p0_alpha_root,
             args.out_dir,
