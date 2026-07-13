@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import argparse
-import concurrent.futures as cf
 import json
 from pathlib import Path
 
+from p2_parallel_runtime import collect_process_map
 from p2_pit_core import *
 from p2_pit_theme import *
 from p2_pit_features import *
@@ -16,12 +16,15 @@ from p2_pit_runner import build_feature_one
 def pool(parts: list[Part], workers: int, function, *args) -> list[dict]:
     if not parts:
         return []
-    results: list[dict] = []
-    with cf.ProcessPoolExecutor(max_workers=workers) as executor:
-        futures = [executor.submit(function, part, *args) for part in parts]
-        for future in cf.as_completed(futures):
-            results.append(future.result())
-    return results
+    worker_count = max(1, min(int(workers), len(parts)))
+    return collect_process_map(
+        parts,
+        worker_count,
+        function,
+        *args,
+        max_in_flight=worker_count * 2,
+        max_tasks_per_child=1,
+    )
 
 
 def save_run_summary(root: str | Path, results: list[dict]) -> None:
