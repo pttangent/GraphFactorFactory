@@ -23,6 +23,8 @@ from p2_parallel_runtime import (
     bounded_thread_map_ordered,
     resolve_max_tasks_per_child,
 )
+from p2_pit_core import Part
+from p2_theme_date_runner import group_parts_by_date
 from run_p2_24core_scheduler import build_plan
 
 
@@ -88,3 +90,26 @@ def test_ordered_thread_map_keeps_order_and_bounded_reorder_window():
     assert first == 0
     assert len(consumed) <= 5
     assert [first, *list(iterator)] == list(range(20))
+
+
+def test_theme_parts_are_bundled_by_single_date_and_largest_date_first(tmp_path: Path):
+    paths = []
+    for name, size in (("a1.parquet", 12), ("a2.parquet", 18), ("b1.parquet", 8)):
+        path = tmp_path / name
+        path.write_bytes(b"x" * size)
+        paths.append(path)
+    parts = [
+        Part("2026-01-02", "1", "5m", paths[0]),
+        Part("2026-01-02", "2", "15m", paths[1]),
+        Part("2026-01-05", "1", "5m", paths[2]),
+    ]
+
+    batches = group_parts_by_date(parts)
+    assert len(batches) == 2
+    assert [{part.date for part in batch} for batch in batches] == [
+        {"2026-01-02"},
+        {"2026-01-05"},
+    ]
+    assert sum(part.base.stat().st_size for part in batches[0]) > sum(
+        part.base.stat().st_size for part in batches[1]
+    )
