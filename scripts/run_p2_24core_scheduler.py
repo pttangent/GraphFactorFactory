@@ -25,6 +25,9 @@ THREAD_CAPS = {
     "GFF_MAX_TASKS_PER_CHILD": "1",
 }
 
+# Conservative peak resident-memory estimates for one outer process. Theme and
+# relation workers still load a full date/layer/scale partition, so they are
+# intentionally much more expensive than graph-state workers.
 BASE_GB_PER_PROCESS = {
     "p0-node-features": 4.5,
     "p0-edge-spillover": 5.5,
@@ -67,6 +70,7 @@ def _nested_shape(target: int, outer_cap: int, requested_inner: int, inner_cap: 
         inner = min(inner_cap, requested_inner)
         outer = max(1, min(outer_cap, math.ceil(target / inner)))
         return outer, inner
+
     best = (1, 1, 1)
     for inner in range(1, inner_cap + 1):
         outer = max(1, min(outer_cap, target // inner))
@@ -86,7 +90,7 @@ def build_plan(
     reserve_ram_gb: float = 24.0,
 ) -> dict[str, StagePlan]:
     target = max(1, min(int(cores), int(math.ceil(cores * target_cpu))))
-    usable_ram = max(8.0, float(ram_gb) - float(reserve_ram_gb))
+    usable_ram = max(8.0, (float(ram_gb) - float(reserve_ram_gb)) * 0.90)
     multiplier = PROFILE_MEMORY_MULTIPLIER[profile]
 
     def memory(stage: str) -> float:
@@ -100,6 +104,7 @@ def build_plan(
     theme_memory = memory("build-theme-returns")
     theme_cap = _worker_cap(usable_ram, theme_memory, target)
     theme_outer, theme_inner = _nested_shape(target, theme_cap, inner_workers)
+
     relation_memory = memory("relation-spillover")
     relation_cap = _worker_cap(usable_ram, relation_memory, target)
     relation_outer, relation_inner = _nested_shape(target, relation_cap, inner_workers)
@@ -215,7 +220,8 @@ def main() -> None:
         "target_cpu": args.target_cpu,
         "ram_gb": args.ram_gb,
         "reserve_ram_gb": args.reserve_ram_gb,
-        "usable_ram_gb": args.ram_gb - args.reserve_ram_gb,
+        "usable_ram_gb": (args.ram_gb - args.reserve_ram_gb) * 0.90,
+        "ram_safety_fraction": 0.90,
         "worker_recycling": "one_partition_per_process",
         "maximum_outer_python_workers": max(stage.workers for stage in plan.values()),
         "stage_plan": {key: asdict(value) for key, value in plan.items()},
