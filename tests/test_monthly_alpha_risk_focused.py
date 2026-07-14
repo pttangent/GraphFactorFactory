@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import sys
 from pathlib import Path
 
@@ -11,10 +12,13 @@ SCRIPTS = ROOT / "scripts"
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
-import generate_monthly_alpha_report_with_risk_focused as focused
+
+def _focused():
+    return importlib.import_module("generate_monthly_alpha_report_with_risk_focused")
 
 
 def test_focused_scope_keeps_only_frozen_b50_intraday_hypotheses(tmp_path: Path):
+    focused = _focused()
     report = tmp_path / "report"
     (report / "p0_eval").mkdir(parents=True)
     pd.DataFrame(
@@ -44,6 +48,7 @@ def test_focused_scope_keeps_only_frozen_b50_intraday_hypotheses(tmp_path: Path)
 
 
 def test_focused_worker_computes_only_b50_and_supports_snapshot_stride(tmp_path: Path):
+    focused = _focused()
     path = tmp_path / "features.parquet"
     rows = []
     for minute in (30, 35, 40, 45):
