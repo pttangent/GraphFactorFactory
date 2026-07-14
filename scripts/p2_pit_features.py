@@ -155,9 +155,15 @@ def build_temporal_episode_map(theme_ids: pd.Series, temporal_edges: pd.DataFram
     components: dict[str, list[str]] = {}
     for node in nodes:
         components.setdefault(find(node), []).append(node)
+
+    # Vectorized parse theme ts to avoid O(N log N) regex operations on single-item series
+    nodes_list = list(nodes)
+    parsed_ts = parse_theme_ts_series(pd.Series(nodes_list))
+    ts_lookup = dict(zip(nodes_list, parsed_ts))
+
     episode_for: dict[str, str] = {}
     for members in components.values():
-        ordered = sorted(members, key=lambda value: (parse_theme_ts_series(pd.Series([value])).iloc[0], value))
+        ordered = sorted(members, key=lambda value: (ts_lookup[value], value))
         episode_id = "episode|" + ordered[0]
         for member in members:
             episode_for[member] = episode_id

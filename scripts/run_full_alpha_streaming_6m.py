@@ -28,14 +28,14 @@ NAS_P2_OUT = Path(r"P:\US-Stock\GFF_Full_Workspace\p2_alpha_full_run")
 MAPPING_PATH = Path(r"D:\DEV\US-Stock\GraphFactorFactory\artifacts\global_symbol_mapping.parquet")
 DAILY_LABELS_PATH = Path(r"D:\DEV\US-Stock\RAW_DATA\1d\daily_labels_2026.parquet")
 MONTHS = ["2026-01", "2026-02", "2026-03", "2026-04", "2026-05", "2026-06"]
-CORES = 24
+CORES = 48
 RAM_GB = 128
 RESERVE_RAM_GB = 24
 LABEL_WORKERS = 8
 P0_DATE_WORKERS = 8
 P0_BATCH_SIZE = 500_000
 P0_MIN_FREE_GB = 50.0
-MIN_FREE_GB_BEFORE_MONTH = 100.0
+MIN_FREE_GB_BEFORE_MONTH = 50.0
 TASKS_PER_CHILD = 8
 PARQUET_TARGET_ROWS = 100_000
 
@@ -245,7 +245,7 @@ def run_p2_month(month: str) -> None:
             "--target-cpu",
             "1.0",
             "--inner-workers",
-            "0",
+            "2",
             "--p0-date-workers",
             str(P0_DATE_WORKERS),
             "--p0-batch-size",

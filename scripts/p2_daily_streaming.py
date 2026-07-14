@@ -49,10 +49,8 @@ def _normalise_snapshot(frame: pd.DataFrame, episode_for: dict[str, str]) -> pd.
     frame["layer_id"] = frame["layer_id"].astype(str)
     frame["scale"] = frame["scale"].astype(str)
     frame["level"] = frame["level"].astype(str)
-    theme_ids = frame["dst_theme_id"].astype(str)
-    frame["theme_episode_id"] = theme_ids.map(episode_for)
-    missing = frame["theme_episode_id"].isna()
-    frame.loc[missing, "theme_episode_id"] = "episode|" + theme_ids.loc[missing]
+    theme_ids = frame["dst_theme_id"].astype(str).tolist()
+    frame["theme_episode_id"] = [episode_for.get(x, "episode|" + x) for x in theme_ids]
     return frame
 
 

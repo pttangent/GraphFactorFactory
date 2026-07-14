@@ -23,9 +23,13 @@ _LABEL_CACHE_INDEXED: pd.DataFrame | None = None
 
 def _lookup_indexed(indexed: pd.DataFrame, decision_time: pd.Timestamp) -> pd.DataFrame:
     try:
-        return indexed.loc[[decision_time]]
+        df = indexed.loc[[decision_time]].copy()
+        df.index.name = None
+        return df
     except KeyError:
-        return pd.DataFrame(columns=indexed.columns)
+        df = pd.DataFrame(columns=indexed.columns)
+        df.index.name = None
+        return df
 
 
 def _cached_labels_indexed(path: Path, fingerprint: dict, horizons: list[str]) -> pd.DataFrame:

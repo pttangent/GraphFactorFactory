@@ -147,7 +147,20 @@ def iter_partition_batches(
     """Read a parquet partition in bounded batches and always close its handle."""
     parquet = pq.ParquetFile(path)
     try:
+        available = set(parquet.schema.names)
+        
+        parse_ts_col = None
+        requested_cols = list(columns) if columns is not None else []
+        if "decision_time" in requested_cols and "decision_time" not in available:
+            for candidate in ("theme_id", "src_theme_id", "dst_theme_id"):
+                if candidate in available:
+                    parse_ts_col = candidate
+                    break
+        
         selected = selected_parquet_columns(parquet, columns)
+        if parse_ts_col and selected is not None and parse_ts_col not in selected:
+            selected.append(parse_ts_col)
+            
         if selected == []:
             return
         row_group_count = parquet.metadata.num_row_groups
@@ -163,6 +176,8 @@ def iter_partition_batches(
                 table = pa.Table.from_batches([batch])
                 frame = _arrow_to_pandas(table)
                 if not frame.empty:
+                    if parse_ts_col:
+                        frame["decision_time"] = parse_theme_ts_series(frame[parse_ts_col])
                     yield frame
     finally:
         parquet.close()
