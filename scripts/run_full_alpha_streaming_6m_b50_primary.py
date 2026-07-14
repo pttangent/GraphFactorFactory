@@ -47,7 +47,7 @@ def policy_run(command: list[str]) -> None:
     if script == "run_p2_24core_scheduler.py" and "--levels" not in command:
         command.extend(["--levels", LEVELS])
     elif script == "generate_monthly_alpha_report.py":
-        command[1] = "scripts/generate_monthly_alpha_report_with_risk_parallel.py"
+        command[1] = "scripts/generate_monthly_alpha_report_with_risk_parallel_v2.py"
         command.extend(
             [
                 "--labels-root", str(base.LOCAL_P0),
