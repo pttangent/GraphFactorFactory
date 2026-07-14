@@ -7,13 +7,13 @@ logic. It only injects an explicit Theme level policy into the public scheduler:
     GFF_RESEARCH_LEVELS=B50          # default primary research
     GFF_RESEARCH_LEVELS=B50,B35      # explicit nested replication run
 
-It also routes monthly reporting through the falsification-audit report wrapper
-and archives the resulting compact report bundle with the month outputs.
+Monthly falsification audits use the public, resumable parallel report runner.
+All resource parameters are supplied through environment/CLI policy rather than
+hard-coded inside Feature or Eval functions.
 """
 from __future__ import annotations
 
 import os
-import sys
 from pathlib import Path
 
 import run_full_alpha_streaming_6m as base
@@ -30,6 +30,12 @@ def _research_levels() -> str:
     return ",".join(dict.fromkeys(levels))
 
 
+def _append_env_option(command: list[str], env_name: str, option: str) -> None:
+    value = os.environ.get(env_name)
+    if value not in (None, ""):
+        command.extend([option, value])
+
+
 LEVELS = _research_levels()
 _ORIGINAL_RUN = base.run
 _ORIGINAL_MONTH_SOURCES = base._month_sources
@@ -41,19 +47,21 @@ def policy_run(command: list[str]) -> None:
     if script == "run_p2_24core_scheduler.py" and "--levels" not in command:
         command.extend(["--levels", LEVELS])
     elif script == "generate_monthly_alpha_report.py":
-        command[1] = "scripts/generate_monthly_alpha_report_with_risk.py"
+        command[1] = "scripts/generate_monthly_alpha_report_with_risk_parallel.py"
         command.extend(
             [
-                "--labels-root",
-                str(base.LOCAL_P0),
-                "--p1-root",
-                str(base.LOCAL_P1),
-                "--primary-level",
-                "B50",
-                "--replication-level",
-                "B35",
+                "--labels-root", str(base.LOCAL_P0),
+                "--p1-root", str(base.LOCAL_P1),
+                "--primary-level", "B50",
+                "--replication-level", "B35",
             ]
         )
+        _append_env_option(command, "GFF_RISK_AUDIT_WORKERS", "--workers")
+        _append_env_option(command, "GFF_RISK_AUDIT_TASKS_PER_CHILD", "--tasks-per-child")
+        _append_env_option(command, "GFF_RISK_AUDIT_MEMORY_BUDGET_GB", "--memory-budget-gb")
+        _append_env_option(command, "GFF_RISK_AUDIT_MAX_FULL_READ_GB", "--max-full-read-gb")
+        _append_env_option(command, "GFF_RISK_AUDIT_READ_MODE", "--read-mode")
+        _append_env_option(command, "GFF_RISK_AUDIT_MAX_IN_FLIGHT", "--max-in-flight")
     _ORIGINAL_RUN(command)
 
 
@@ -73,7 +81,8 @@ base._month_sources = month_sources_with_report
 def main() -> None:
     print(
         f"B50-primary research policy active: levels={LEVELS}; "
-        "B35 is counted only as an explicit nested replication.",
+        "B35 is counted only as an explicit nested replication. "
+        "Risk audits are partition-parallel and checkpoint-resumable.",
         flush=True,
     )
     base.main()
