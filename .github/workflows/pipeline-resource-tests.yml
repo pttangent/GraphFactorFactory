@@ -56,6 +56,7 @@ jobs:
           scripts/generate_monthly_alpha_report.py
           scripts/generate_monthly_alpha_report_with_risk.py
           scripts/generate_monthly_alpha_report_with_risk_parallel.py
+          scripts/generate_monthly_alpha_report_with_risk_parallel_v2.py
           scripts/p2_checkpoint.py
           scripts/p2_eval_layout.py
           scripts/p2_parallel_runtime.py
