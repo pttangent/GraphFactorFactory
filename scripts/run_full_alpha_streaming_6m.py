@@ -56,6 +56,7 @@ def run(command: list[str]) -> None:
     environment = os.environ.copy()
     environment["GFF_MAX_TASKS_PER_CHILD"] = str(TASKS_PER_CHILD)
     environment["GFF_PARQUET_TARGET_ROWS"] = str(PARQUET_TARGET_ROWS)
+    environment["PYTHONIOENCODING"] = "utf-8"
     return_code = run_process_tree(command, env=environment)
     if return_code != 0:
         raise RuntimeError(f"command failed with code {return_code}: {' '.join(command)}")
