@@ -134,7 +134,7 @@ def test_b50_launcher_only_changes_public_level_and_reporting_policy():
     source = (ROOT / "scripts" / "run_full_alpha_streaming_6m_b50_primary.py").read_text(encoding="utf-8")
     assert "GFF_RESEARCH_LEVELS" in source
     assert 'command.extend(["--levels", LEVELS])' in source
-    assert "generate_monthly_alpha_report_with_risk.py" in source
+    assert "generate_monthly_alpha_report_with_risk_parallel.py" in source
     assert "monthly_alpha_report" in source
     for forbidden in ("label_", "target_", "rank_ic", "top_minus_bottom", "pit_audit_pass"):
         assert forbidden not in source
