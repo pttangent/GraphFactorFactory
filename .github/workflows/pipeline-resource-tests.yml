@@ -10,6 +10,7 @@ on:
       - "tests/test_p0_eval_report.py"
       - "tests/test_monthly_alpha_report.py"
       - "tests/test_monthly_alpha_risk_report.py"
+      - "tests/test_monthly_alpha_risk_parallel.py"
       - "tests/test_p2_eval_resumable.py"
       - "tests/test_p2_daily_streaming.py"
       - "tests/test_p2_parallel_runtime.py"
@@ -23,6 +24,7 @@ on:
       - "tests/test_p0_eval_report.py"
       - "tests/test_monthly_alpha_report.py"
       - "tests/test_monthly_alpha_risk_report.py"
+      - "tests/test_monthly_alpha_risk_parallel.py"
       - "tests/test_p2_eval_resumable.py"
       - "tests/test_p2_daily_streaming.py"
       - "tests/test_p2_parallel_runtime.py"
@@ -53,6 +55,7 @@ jobs:
           scripts/generate_p0_eval_report.py
           scripts/generate_monthly_alpha_report.py
           scripts/generate_monthly_alpha_report_with_risk.py
+          scripts/generate_monthly_alpha_report_with_risk_parallel.py
           scripts/p2_checkpoint.py
           scripts/p2_eval_layout.py
           scripts/p2_parallel_runtime.py
@@ -77,6 +80,7 @@ jobs:
           tests/test_p0_eval_report.py
           tests/test_monthly_alpha_report.py
           tests/test_monthly_alpha_risk_report.py
+          tests/test_monthly_alpha_risk_parallel.py
           tests/test_p2_eval_resumable.py
           tests/test_p2_daily_streaming.py
           tests/test_p2_parallel_runtime.py
