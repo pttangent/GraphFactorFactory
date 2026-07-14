@@ -519,11 +519,11 @@ def _scan_theme_returns(root: Path, month: str, batch_size: int, progress_every:
                         sum_val = float(vals.sum())
                         sumsq_val = float(vals.pow(2).sum())
                         pos_count = int(vals.gt(0).sum())
-                        partials.append(pd.DataFrame([{
+                        partials.append({
                             "date": date, "layer_id": layer, "scale": scale, "level": level_str,
                             "observations": count, "return_sum": sum_val, "return_sumsq": sumsq_val,
                             "positive_count": pos_count, "variant": variant, "horizon": horizon
-                        }]))
+                        })
         finally:
             parquet.close()
         if progress_every and (file_index % progress_every == 0 or file_index == len(files)):
@@ -531,7 +531,7 @@ def _scan_theme_returns(root: Path, month: str, batch_size: int, progress_every:
             print(f"[monthly-report/theme] files={file_index}/{len(files)} rows={stats.rows:,} rate={stats.rows / elapsed:,.0f}/s", flush=True)
     if not partials:
         return pd.DataFrame(), stats
-    daily = pd.concat(partials, ignore_index=True)
+    daily = pd.DataFrame(partials)
     keys = ["date", "layer_id", "scale", "level", "variant", "horizon"]
     numeric = ["observations", "return_sum", "return_sumsq", "positive_count"]
     daily = daily.groupby(keys, sort=False, dropna=False)[numeric].sum().reset_index()
