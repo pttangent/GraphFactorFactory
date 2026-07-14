@@ -8,6 +8,7 @@ on:
       - "scripts/**"
       - "tests/test_p0_eval_parallel.py"
       - "tests/test_p0_eval_report.py"
+      - "tests/test_monthly_alpha_report.py"
       - "tests/test_p2_eval_resumable.py"
       - "tests/test_p2_daily_streaming.py"
       - "tests/test_p2_parallel_runtime.py"
@@ -19,6 +20,7 @@ on:
       - "scripts/**"
       - "tests/test_p0_eval_parallel.py"
       - "tests/test_p0_eval_report.py"
+      - "tests/test_monthly_alpha_report.py"
       - "tests/test_p2_eval_resumable.py"
       - "tests/test_p2_daily_streaming.py"
       - "tests/test_p2_parallel_runtime.py"
@@ -47,6 +49,7 @@ jobs:
         run: >-
           python -m compileall -q
           scripts/generate_p0_eval_report.py
+          scripts/generate_monthly_alpha_report.py
           scripts/p2_checkpoint.py
           scripts/p2_eval_layout.py
           scripts/p2_parallel_runtime.py
@@ -68,6 +71,7 @@ jobs:
           python -m pytest -q
           tests/test_p0_eval_parallel.py
           tests/test_p0_eval_report.py
+          tests/test_monthly_alpha_report.py
           tests/test_p2_eval_resumable.py
           tests/test_p2_daily_streaming.py
           tests/test_p2_parallel_runtime.py
