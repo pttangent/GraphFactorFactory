@@ -501,13 +501,13 @@ def _scan_theme_returns(root: Path, month: str, batch_size: int, progress_every:
                     frame["level"] = "UNKNOWN"
                 derived = {}
                 for col, (variant, horizon) in specs.items():
-                    derived[col] = (variant, horizon, pd.to_numeric(frame[col], errors="coerce"))
+                    derived[col] = (variant, horizon, frame[col])
                 for horizon in sorted({item[1] for item in specs.values()}):
                     eq, core, top5 = f"ret_eq_{horizon}", f"ret_core_{horizon}", f"ret_top5_{horizon}"
                     if eq in frame and core in frame:
-                        derived[f"core_minus_eq_{horizon}"] = ("core_minus_eq", horizon, pd.to_numeric(frame[core], errors="coerce") - pd.to_numeric(frame[eq], errors="coerce"))
+                        derived[f"core_minus_eq_{horizon}"] = ("core_minus_eq", horizon, frame[core] - frame[eq])
                     if eq in frame and top5 in frame:
-                        derived[f"top5_minus_eq_{horizon}"] = ("top5_minus_eq", horizon, pd.to_numeric(frame[top5], errors="coerce") - pd.to_numeric(frame[eq], errors="coerce"))
+                        derived[f"top5_minus_eq_{horizon}"] = ("top5_minus_eq", horizon, frame[top5] - frame[eq])
                 for level, sub in frame.groupby("level", sort=False, dropna=False):
                     level_str = str(level)
                     sub_idx = sub.index
