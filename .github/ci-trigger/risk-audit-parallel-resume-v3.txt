@@ -1,0 +1,1 @@
+validate candidate-granular P0 checkpoints and parallel resume
