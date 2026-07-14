@@ -499,26 +499,31 @@ def _scan_theme_returns(root: Path, month: str, batch_size: int, progress_every:
                     continue
                 if "level" not in frame:
                     frame["level"] = "UNKNOWN"
-                frame["date"], frame["layer_id"], frame["scale"] = date, layer, scale
-                derived = {column: (variant, horizon, pd.to_numeric(frame[column], errors="coerce")) for column, (variant, horizon) in specs.items()}
+                derived = {}
+                for col, (variant, horizon) in specs.items():
+                    derived[col] = (variant, horizon, pd.to_numeric(frame[col], errors="coerce"))
                 for horizon in sorted({item[1] for item in specs.values()}):
                     eq, core, top5 = f"ret_eq_{horizon}", f"ret_core_{horizon}", f"ret_top5_{horizon}"
                     if eq in frame and core in frame:
                         derived[f"core_minus_eq_{horizon}"] = ("core_minus_eq", horizon, pd.to_numeric(frame[core], errors="coerce") - pd.to_numeric(frame[eq], errors="coerce"))
                     if eq in frame and top5 in frame:
                         derived[f"top5_minus_eq_{horizon}"] = ("top5_minus_eq", horizon, pd.to_numeric(frame[top5], errors="coerce") - pd.to_numeric(frame[eq], errors="coerce"))
-                for _, (variant, horizon, values) in derived.items():
-                    work = frame[["date", "layer_id", "scale", "level"]].copy()
-                    work["value"] = values
-                    work = work.dropna(subset=["value"])
-                    if work.empty:
-                        continue
-                    work["value_sq"], work["positive"] = work["value"].pow(2), work["value"].gt(0).astype("int64")
-                    grouped = work.groupby(["date", "layer_id", "scale", "level"], sort=False, dropna=False).agg(
-                        observations=("value", "size"), return_sum=("value", "sum"),
-                        return_sumsq=("value_sq", "sum"), positive_count=("positive", "sum")).reset_index()
-                    grouped["variant"], grouped["horizon"] = variant, horizon
-                    partials.append(grouped)
+                for level, sub in frame.groupby("level", sort=False, dropna=False):
+                    level_str = str(level)
+                    sub_idx = sub.index
+                    for col, (variant, horizon, values) in derived.items():
+                        vals = values.loc[sub_idx].dropna()
+                        if vals.empty:
+                            continue
+                        count = len(vals)
+                        sum_val = float(vals.sum())
+                        sumsq_val = float(vals.pow(2).sum())
+                        pos_count = int(vals.gt(0).sum())
+                        partials.append(pd.DataFrame([{
+                            "date": date, "layer_id": layer, "scale": scale, "level": level_str,
+                            "observations": count, "return_sum": sum_val, "return_sumsq": sumsq_val,
+                            "positive_count": pos_count, "variant": variant, "horizon": horizon
+                        }]))
         finally:
             parquet.close()
         if progress_every and (file_index % progress_every == 0 or file_index == len(files)):
