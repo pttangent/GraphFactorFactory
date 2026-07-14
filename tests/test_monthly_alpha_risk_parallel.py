@@ -14,7 +14,7 @@ for directory in (SCRIPTS, TESTS):
     if str(directory) not in sys.path:
         sys.path.insert(0, str(directory))
 
-import generate_monthly_alpha_report_with_risk_parallel as parallel
+import generate_monthly_alpha_report_with_risk_parallel_v2 as parallel
 from test_monthly_alpha_risk_report import _base_report, _inputs
 
 
@@ -58,7 +58,7 @@ def test_parallel_risk_audit_is_resumable_and_numerically_stable(tmp_path: Path)
     assert first_scan["p0"]["computed"] > 0
     assert first_scan["intraday"]["reused"] == 0
     assert list((checkpoints / "p2").glob("part-*.json"))
-    assert list((checkpoints / "p0").glob("part-*.json"))
+    assert list((checkpoints / "p0").rglob("part-*.json"))
 
     second = _run(tmp_path, report, labels, p1, checkpoints)
     second_payload = json.loads((report / "monthly_alpha_report.json").read_text(encoding="utf-8"))
