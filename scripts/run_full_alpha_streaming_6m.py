@@ -373,6 +373,17 @@ def main() -> None:
             continue
         prefetch_month(month)
         run_p2_month(month)
+        print(f"[{time.strftime('%H:%M:%S')}] Generating monthly alpha report for {month}...", flush=True)
+        run(
+            [
+                sys.executable,
+                "scripts/generate_monthly_alpha_report.py",
+                "--p2-root",
+                str(LOCAL_P2_OUT),
+                "--month",
+                month,
+            ]
+        )
         archive_month_outputs(month)
         cleanup_month_inputs(month)
     run_global_evaluation()
