@@ -1,0 +1,1 @@
+validate checkpoint resume after interface test update
