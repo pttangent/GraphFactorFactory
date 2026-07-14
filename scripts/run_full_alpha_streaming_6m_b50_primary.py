@@ -2,14 +2,17 @@
 """B50-primary policy launcher for the existing six-month PIT-safe pipeline.
 
 This wrapper does not alter any label, feature, PIT, IC, spread, or checkpoint
-logic. It only injects an explicit Theme level policy into the public scheduler:
+logic. It injects an explicit Theme level policy into the public scheduler and
+routes monthly falsification through the focused B50-only audit profile.
 
     GFF_RESEARCH_LEVELS=B50          # default primary research
     GFF_RESEARCH_LEVELS=B50,B35      # explicit nested replication run
 
-Monthly falsification audits use the public, resumable parallel report runner.
-All resource parameters are supplied through environment/CLI policy rather than
-hard-coded inside Feature or Eval functions.
+The focused risk audit excludes Daily Alpha and the full discovery search space.
+Optional screening controls are inherited directly by the focused runner:
+
+    GFF_RISK_AUDIT_MAX_DAYS=6
+    GFF_RISK_AUDIT_SNAPSHOT_STRIDE=3
 """
 from __future__ import annotations
 
@@ -47,7 +50,7 @@ def policy_run(command: list[str]) -> None:
     if script == "run_p2_24core_scheduler.py" and "--levels" not in command:
         command.extend(["--levels", LEVELS])
     elif script == "generate_monthly_alpha_report.py":
-        command[1] = "scripts/generate_monthly_alpha_report_with_risk_parallel_v2.py"
+        command[1] = "scripts/generate_monthly_alpha_report_with_risk_focused.py"
         command.extend(
             [
                 "--labels-root", str(base.LOCAL_P0),
@@ -82,7 +85,7 @@ def main() -> None:
     print(
         f"B50-primary research policy active: levels={LEVELS}; "
         "B35 is counted only as an explicit nested replication. "
-        "Risk audits are partition-parallel and checkpoint-resumable.",
+        "Monthly falsification uses the focused B50-only profile and excludes Daily Alpha.",
         flush=True,
     )
     base.main()
